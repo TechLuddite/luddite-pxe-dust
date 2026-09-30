@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "techluddite.pxe-dust",
+  "name": "PXE Dust",
+  "version": "0.2.0",
+  "author": "TechLuddite",
+  "description": "Serve the Omarchy installer on your existing LAN or a dedicated Ethernet network",
+  "kinds": ["bar-widget"],
+  "entryPoints": {"barWidget": "Panel.qml"},
+  "barWidget": {
+    "displayName": "PXE Dust",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

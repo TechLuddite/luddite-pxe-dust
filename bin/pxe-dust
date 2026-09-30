@@ -1,0 +1,832 @@
+#!/usr/bin/python3 -I
+"""PXE Dust: explicit, Omarchy netboot on an existing LAN or dedicated Ethernet link."""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import http.server
+import ipaddress
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import selectors
+import shutil
+import signal
+import socket
+import socketserver
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+VERSION = "0.2.0"
+LIBEXEC = "/usr/local/libexec/pxe-dust"
+DATA = Path("/var/lib/pxe-dust")
+RUN = Path("/run/pxe-dust")
+NETNS = "pxe-dust"
+UNIT = "pxe-dust.service"
+SERVER = "192.168.173.1"
+NETWORK = "192.168.173.0/24"
+PORT = 8080
+MAX_ISO = 12 * 1024**3
+ENV = {"PATH": "/usr/bin:/usr/sbin", "LANG": "C", "LC_ALL": "C"}
+IPXE = Path("/usr/share/ipxe/x86_64/ipxe.efi")
+REQUIRED = ("/usr/bin/ip", "/usr/bin/dnsmasq", "/usr/bin/bsdtar", "/usr/bin/nmcli")
+INSTALLED = {
+    "/usr/local/libexec/pxe-dust": "bin/pxe-dust",
+    "/usr/local/bin/pxe-dust": "bin/pxe-dust",
+    "/etc/systemd/system/pxe-dust.service": "system/pxe-dust.service",
+    "/usr/share/polkit-1/actions/org.techluddite.pxe-dust.policy": "system/org.techluddite.pxe-dust.policy",
+}
+
+
+class Error(Exception):
+    pass
+
+
+class CommandError(Error):
+    def __init__(self, message, returncode):
+        super().__init__(message)
+        self.returncode = returncode
+
+
+def bounded(argv, limit=65536, timeout=15, output=None, **kwargs):
+    """Bound both pipes while streaming, with a process-group deadline."""
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            env=ENV, start_new_session=True, **kwargs)
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ, "out")
+    sel.register(proc.stderr, selectors.EVENT_READ, "err")
+    data = {"out": bytearray(), "err": bytearray()}
+    sizes = {"out": 0, "err": 0}
+    deadline = time.monotonic() + timeout
+    try:
+        while sel.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Error("Command exceeded its time limit")
+            for key, _ in sel.select(min(remaining, 0.2)):
+                chunk = os.read(key.fd, 65536)
+                if not chunk:
+                    sel.unregister(key.fileobj)
+                    continue
+                kind = key.data
+                sizes[kind] += len(chunk)
+                if sizes[kind] > (limit if kind == "out" else 8192):
+                    raise Error("Command exceeded its output limit")
+                if kind == "out" and output is not None:
+                    output.write(chunk)
+                else:
+                    data[kind].extend(chunk)
+        proc.wait(timeout=max(0.01, deadline - time.monotonic()))
+        if proc.returncode:
+            message = data["err"].decode("utf-8", "replace")[:800]
+            raise CommandError(f"{Path(argv[0]).name} failed: {message or proc.returncode}", proc.returncode)
+        return bytes(data["out"])
+    finally:
+        # The group can outlive its leader; kill it even after the leader exits.
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        sel.close()
+        proc.stdout.close()
+        proc.stderr.close()
+
+
+def ip(*args):
+    return bounded(["/usr/bin/ip", *args])
+
+
+def trusted_dir(path, create=False):
+    """Walk privileged paths without following symlinks or writable parents."""
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in Path(path).parts[1:]:
+            if create:
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(part, 0o755, dir_fd=fd)
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            info = os.fstat(fd)
+            if info.st_uid != 0 or info.st_mode & 0o022:
+                raise Error("Privileged directory is not root-owned and protected")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_json(path, default=None):
+    try:
+        parent = trusted_dir(path.parent)
+    except FileNotFoundError:
+        return default
+    try:
+        try:
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        except FileNotFoundError:
+            return default
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                raise Error("Untrusted state file")
+            raw = stream.read(32769)
+            if len(raw) > 32768:
+                raise Error("State file too large")
+            return json.loads(raw)
+    finally:
+        os.close(parent)
+
+
+def write_json(path, value):
+    payload = (json.dumps(value) + "\n").encode()
+    if len(payload) > 32768:
+        raise Error("State exceeds limit")
+    fd = trusted_dir(path.parent, create=True)
+    try:
+        name = f".{path.name}.{os.urandom(12).hex()}"
+        out = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=fd)
+        try:
+            with os.fdopen(out, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.rename(name, path.name, src_dir_fd=fd, dst_dir_fd=fd)
+            os.fsync(fd)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(name, dir_fd=fd)
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def mutation_lock():
+    fd = trusted_dir(DATA, create=True)
+    try:
+        lock = os.open("lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=fd)
+        try:
+            info = os.fstat(lock)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1:
+                raise Error("Invalid lock")
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Error("Another PXE Dust operation is in progress") from None
+            yield
+        finally:
+            os.close(lock)
+    finally:
+        os.close(fd)
+
+
+def interface_name(value):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,14}", value) or value == "lo":
+        raise Error("Invalid Ethernet interface name")
+    return value
+
+
+def interfaces():
+    links = json.loads(ip("-j", "address", "show"))
+    return [{"name": x["ifname"], "up": "UP" in x.get("flags", []),
+             "addresses": len(x.get("addr_info", []))}
+            for x in links[:128] if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,14}", x["ifname"])
+            and x.get("link_type") == "ether" and Path("/sys/class/net", x["ifname"], "device").exists()
+            and not Path("/sys/class/net", x["ifname"], "wireless").exists()]
+
+
+def preflight(name, mode="dedicated"):
+    interface_name(name)
+    if mode not in ("lan", "dedicated"):
+        raise Error("Unknown network mode")
+    missing = [p for p in REQUIRED if not os.access(p, os.X_OK)]
+    if not IPXE.is_file():
+        missing.append(str(IPXE))
+    if missing:
+        raise Error("Missing prerequisites: " + ", ".join(missing))
+    rows = json.loads(ip("-j", "address", "show", "dev", name))
+    if len(rows) != 1:
+        raise Error("Ethernet interface not found")
+    row = rows[0]
+    if (row.get("link_type") != "ether" or row.get("master") or row.get("linkinfo")
+            or Path("/sys/class/net", name, "wireless").exists()):
+        raise Error("Select a physical Ethernet interface")
+    if mode == "lan":
+        if not Path("/sys/class/net", name, "device").exists():
+            raise Error("Select a physical Ethernet adapter")
+        if not os.access("/usr/bin/iptables", os.X_OK):
+            raise Error("Existing LAN mode requires iptables for temporary firewall rules")
+        server, network = lan_address(row)
+        return {"mode": "lan", "interface": name, "ifindex": row["ifindex"],
+                "address": row["address"], "server": server, "network": network,
+                "firewall_chain": "PXDUST_" + os.urandom(6).hex()}
+    if "UP" in row.get("flags", []) or row.get("addr_info"):
+        raise Error("Disconnect the dedicated interface first; it must be down with no addresses")
+    if not Path("/sys/class/net", name, "device").exists():
+        raise Error("Select a physical Ethernet adapter, not a virtual network")
+    for family in ("-4", "-6"):
+        if json.loads(ip("-j", family, "route", "show", "table", "all", "dev", name)):
+            raise Error("Interface has routes; refusing to repurpose it")
+    managed = bounded(["/usr/bin/nmcli", "-g", "GENERAL.NM-MANAGED", "device", "show", name]).strip()
+    if managed not in (b"yes", b"no"):
+        raise Error("Cannot determine NetworkManager management state")
+    if Path("/run/netns", NETNS).exists():
+        raise Error("PXE namespace already exists; stop or recover the previous session first")
+    return {"mode": "dedicated", "interface": name, "ifindex": row["ifindex"], "address": row["address"],
+            "managed": managed == b"yes", "server": SERVER, "network": NETWORK}
+
+
+def lan_address(row):
+    if "UP" not in row.get("flags", []):
+        raise Error("Existing LAN mode needs a connected Ethernet interface")
+    addresses = [a for a in row.get("addr_info", []) if a.get("family") == "inet" and a.get("scope") == "global"]
+    if len(addresses) != 1:
+        raise Error("Existing LAN mode needs exactly one global-scope IPv4 address")
+    address = addresses[0]
+    iface = ipaddress.IPv4Interface(f"{address['local']}/{address['prefixlen']}")
+    if (iface.ip.is_loopback or iface.ip.is_link_local or iface.ip.is_multicast
+            or iface.ip.is_unspecified or iface.network.prefixlen > 30
+            or iface.ip in (iface.network.network_address, iface.network.broadcast_address)):
+        raise Error("Unsupported LAN IPv4 address or subnet")
+    return str(iface.ip), str(iface.network)
+
+
+def lan_unchanged(session):
+    rows = json.loads(ip("-j", "address", "show", "dev", session["interface"]))
+    if len(rows) != 1 or rows[0].get("address") != session["address"] or rows[0].get("ifindex") != session["ifindex"]:
+        raise Error("LAN adapter changed; stopping boot services")
+    if lan_address(rows[0]) != (session["server"], session["network"]):
+        raise Error("LAN IPv4 address changed; restart PXE Dust to use the new address")
+
+
+def firewall_exists(*args):
+    try:
+        bounded(["/usr/bin/iptables", "-w", "5", *args])
+        return True
+    except CommandError as exc:
+        if exc.returncode == 1:
+            return False
+        raise
+
+
+def firewall_jump(session):
+    return ["-i", interface_name(session["interface"]), "-m", "comment",
+            "--comment", "pxe-dust:" + session["firewall_chain"], "-j", session["firewall_chain"]]
+
+
+def firewall_install(session):
+    chain = session["firewall_chain"]
+    if not re.fullmatch(r"PXDUST_[0-9a-f]{12}", chain):
+        raise Error("Invalid session firewall chain")
+    def rule(*args):
+        bounded(["/usr/bin/iptables", "-w", "5", *args])
+    rule("-N", chain)
+    # DHCP discovery may originate at 0.0.0.0 and target a broadcast address.
+    rule("-A", chain, "-p", "udp", "--dport", "67", "-j", "ACCEPT")
+    for proto, ports in (("udp", "69,4011,40000:40031"), ("tcp", str(PORT))):
+        rule("-A", chain, "-s", session["network"], "-d", session["server"],
+             "-p", proto, "-m", "multiport", "--dports", ports, "-j", "ACCEPT")
+    rule("-I", "INPUT", "1", *firewall_jump(session))
+
+
+def firewall_cleanup(session):
+    chain = session["firewall_chain"]
+    if not re.fullmatch(r"PXDUST_[0-9a-f]{12}", chain):
+        raise Error("Invalid session firewall chain")
+    # nft-backed iptables returns a syntax error for -C with a missing target.
+    # An absent chain cannot have references, so first check the chain itself.
+    if not firewall_exists("-S", chain):
+        return
+    jump = firewall_jump(session)
+    if firewall_exists("-C", "INPUT", *jump):
+        bounded(["/usr/bin/iptables", "-w", "5", "-D", "INPUT", *jump])
+    bounded(["/usr/bin/iptables", "-w", "5", "-F", chain])
+    bounded(["/usr/bin/iptables", "-w", "5", "-X", chain])
+
+
+def choose_assets(names):
+    """Only known archive members can become public boot assets."""
+    if len(names) != len(set(names)):
+        raise Error("ISO contains duplicate archive paths")
+    names = set(names)
+    base = "arch/boot/x86_64/"
+    kernel = next((k for k in ("linux", "linux-t2")
+                   if base + "vmlinuz-" + k in names and base + "initramfs-" + k + ".img" in names), None)
+    if kernel is None or "arch/x86_64/airootfs.sfs" not in names:
+        raise Error("Unsupported ISO: expected Omarchy/Arch x86_64 kernel, initramfs and squashfs")
+    result = {"vmlinuz": base + "vmlinuz-" + kernel,
+              "initramfs.img": base + "initramfs-" + kernel + ".img",
+              "airootfs.sfs": "arch/x86_64/airootfs.sfs"}
+    for filename in ("airootfs.sha512", "airootfs.sfs.cms.sig"):
+        member = "arch/x86_64/" + filename
+        if member in names:
+            result[filename] = member
+    return result
+
+
+def boot_script(signed, server=SERVER):
+    server = str(ipaddress.IPv4Address(server))
+    verify = " cms_verify=y" if signed else ""
+    return ("#!ipxe\n"
+            f"set base http://{server}:{PORT}\n"
+            "echo Starting the Omarchy installer from PXE Dust\n"
+            "kernel ${base}/vmlinuz initrd=initramfs.img ip=dhcp "
+            "archisobasedir=arch archiso_http_srv=${base}/ "
+            f"initramfs_async=0{verify}\n"
+            "initrd --name initramfs.img ${base}/initramfs.img\n"
+            "boot\n").encode()
+
+
+def dnsmasq_config(session=None):
+    session = session or {"mode": "dedicated", "server": SERVER, "interface": "pxe0", "network": NETWORK}
+    lan = session.get("mode") == "lan"
+    name = interface_name(session["interface"]) if lan else "pxe0"
+    server = str(ipaddress.IPv4Address(session["server"]))
+    common = (f"port=0\ninterface={name}\nexcept-interface=lo\nbind-interfaces\n"
+              "pid-file=/run/pxe-dust/dnsmasq.pid\nleasefile-ro\n"
+              "dhcp-match=set:efi64,option:client-arch,7\n"
+              "dhcp-match=set:efi64,option:client-arch,9\n"
+              "dhcp-userclass=set:ipxe,iPXE\ndhcp-match=set:ipxe,175\n"
+              f"dhcp-boot=tag:!ipxe,tag:efi64,ipxe.efi,,{server}\n"
+              f"dhcp-boot=tag:ipxe,http://{server}:{PORT}/boot.ipxe\n"
+              "enable-tftp\ntftp-root=/var/lib/pxe-dust/image/tftp\n"
+              "tftp-port-range=40000,40031\ntftp-max=16\nlog-dhcp\nlog-facility=-\n")
+    if lan:
+        network = ipaddress.IPv4Network(session["network"])
+        config = f"dhcp-range={network.network_address},proxy,{network.netmask}\n"
+        for arch in (7, 9):
+            config += f'pxe-service=tag:!ipxe,{arch},"PXE Dust",ipxe.efi,{server}\n'
+            config += f'pxe-service=tag:ipxe,{arch},"Omarchy",http://{server}:{PORT}/boot.ipxe,{server}\n'
+        return (common + config).encode()
+    # The dedicated network supplies addresses but no router or DNS server.
+    return (common + "dhcp-range=192.168.173.20,192.168.173.200,255.255.255.0,1h\n"
+            "dhcp-option=3\ndhcp-option=6\ndhcp-lease-max=181\n").encode()
+
+
+def caller_open(path):
+    """Resolve user paths with the invoking user's access rights, never root's."""
+    uid = int(os.environ.get("PKEXEC_UID", os.environ.get("SUDO_UID", os.getuid())))
+    old_uid, old_gid, groups = os.geteuid(), os.getegid(), os.getgroups()
+    try:
+        if old_uid == 0 and uid != 0:
+            account = pwd.getpwuid(uid)
+            os.initgroups(account.pw_name, account.pw_gid)
+            os.setegid(account.pw_gid)
+            os.seteuid(uid)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    finally:
+        if old_uid == 0:
+            os.seteuid(old_uid)
+            os.setegid(old_gid)
+            os.setgroups(groups)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_ISO:
+        os.close(fd)
+        raise Error("Image must be a regular file of at most 12 GiB")
+    return fd
+
+
+def service_state():
+    return bounded(["/usr/bin/systemctl", "show", "--property=ActiveState", "--value", UNIT]).decode().strip()
+
+
+def prepare(path, digest):
+    if not re.fullmatch("[0-9a-fA-F]{64}", digest):
+        raise Error("Supply the published SHA-256 (64 hexadecimal characters)")
+    if service_state() not in ("inactive", "failed"):
+        raise Error("Stop the server before replacing the image")
+    with os.fdopen(caller_open(path), "rb") as source, tempfile.TemporaryDirectory(prefix="prepare-", dir=DATA) as temporary:
+        staging = Path(temporary)
+        # Private staging remains root-only. Only inherited descriptors reach bsdtar.
+        with tempfile.TemporaryFile(dir=staging) as iso:
+            total = 0
+            sha = hashlib.sha256()
+            deadline = time.monotonic() + 900
+            while chunk := source.read(1024 * 1024):
+                total += len(chunk)
+                if total > MAX_ISO or time.monotonic() > deadline:
+                    raise Error("Image exceeds preparation limits")
+                iso.write(chunk)
+                sha.update(chunk)
+            if sha.hexdigest() != digest.lower():
+                raise Error("SHA-256 mismatch; cached image was not changed")
+            iso.flush()
+            iso.seek(0)
+            nobody = pwd.getpwnam("nobody")
+            options = {"stdin": iso.fileno(), "user": nobody.pw_uid,
+                       "group": nobody.pw_gid, "extra_groups": []}
+            # stdin uses the inherited open descriptor. Reopening /proc/self/fd/N
+            # would recheck permissions and fail after dropping to nobody.
+            names = bounded(["/usr/bin/bsdtar", "-tf", "-"], limit=1024**2, timeout=90, **options).decode("utf-8", "strict").splitlines()
+            assets = choose_assets(names)
+            image = staging / "image"
+            image.mkdir(mode=0o755)
+            (image / "tftp").mkdir(mode=0o755)
+            for output, member in assets.items():
+                iso.seek(0)
+                with (image / output).open("xb") as target:
+                    cap = MAX_ISO if output == "airootfs.sfs" else (512 * 1024**2
+                          if output in ("vmlinuz", "initramfs.img") else 1024**2)
+                    bounded(["/usr/bin/bsdtar", "-xOf", "-", "--", member], limit=cap,
+                            timeout=900, output=target, **options)
+                if not (image / output).stat().st_size:
+                    raise Error("Empty boot asset")
+            # Root-owned system package, never a downloaded EFI executable.
+            with IPXE.open("rb") as source_ipxe, (image / "tftp/ipxe.efi").open("xb") as target:
+                shutil.copyfileobj(source_ipxe, target)
+            meta = {"sha256": digest.lower(), "bytes": total, "prepared": int(time.time()),
+                    "kernel": assets["vmlinuz"], "signed_rootfs": "airootfs.sfs.cms.sig" in assets}
+            (image / "metadata.json").write_text(json.dumps(meta))
+            # A stopped service and mutation lock make replacing the one cache safe.
+            old = DATA / "previous-image"
+            if old.exists():
+                raise Error("Previous image remains from interrupted preparation; inspect it before retrying")
+            if (DATA / "image").exists():
+                os.rename(DATA / "image", old)
+            try:
+                os.rename(image, DATA / "image")
+            except BaseException:
+                if old.exists():
+                    os.rename(old, DATA / "image")
+                raise
+            if old.exists():
+                shutil.rmtree(old)  # fixed root-owned tree created only by this helper
+    return {"ok": True, "message": "Image verified and prepared"}
+
+
+def start(name, dedicated=False, lan=False):
+    if dedicated == lan:
+        raise Error("Choose exactly one explicit mode: --lan or --dedicated")
+    mode = "lan" if lan else "dedicated"
+    if service_state() not in ("inactive", "failed"):
+        raise Error("PXE Dust is already starting or serving")
+    if read_json(DATA / "image/metadata.json") is None:
+        raise Error("Prepare an Omarchy ISO first")
+    preflight(name, mode)
+    write_json(DATA / "request.json", {"interface": name, "mode": mode})
+    bounded(["/usr/bin/systemctl", "start", UNIT], timeout=50)
+    return {"ok": True, "message": "Serving on the existing LAN" if lan else "Serving on the dedicated Ethernet network"}
+
+
+def notify_ready():
+    path = os.environ.get("NOTIFY_SOCKET")
+    if path:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.connect("\0" + path[1:] if path.startswith("@") else path)
+            sock.sendall(b"READY=1")
+
+
+def cleanup():
+    session = read_json(DATA / "session.json")
+    if not session:
+        return
+    name = interface_name(session["interface"])
+    if session.get("mode") == "lan":
+        firewall_cleanup(session)
+        (DATA / "session.json").unlink()
+        return
+    if Path("/run/netns", NETNS).exists():
+        links = json.loads(ip("-n", NETNS, "-j", "link", "show"))
+        candidates = [x for x in links if x["ifname"] in ("pxe0", name)]
+        if candidates:
+            current = candidates[0]["ifname"]
+            if candidates[0].get("address") != session["address"]:
+                raise Error("Deployment interface identity changed; refusing cleanup")
+            ip("-n", NETNS, "link", "set", "dev", current, "down")
+            ip("-n", NETNS, "address", "flush", "dev", current)
+            if current != name:
+                ip("-n", NETNS, "link", "set", "dev", current, "name", name)
+            ip("-n", NETNS, "link", "set", "dev", name, "netns", "1")
+        ip("netns", "delete", NETNS)
+    restored = json.loads(ip("-j", "link", "show", "dev", name))
+    if len(restored) != 1 or restored[0].get("address") != session["address"]:
+        raise Error("Original interface is missing or changed; reconnect it and run recover")
+    bounded(["/usr/bin/nmcli", "device", "set", name, "managed",
+             "yes" if session["managed"] else "no"])
+    (DATA / "session.json").unlink()
+
+
+def serve():
+    request = read_json(DATA / "request.json")
+    if not request:
+        raise Error("No requested interface")
+    session = preflight(request["interface"], request.get("mode", "dedicated"))
+    name = session["interface"]
+    # Journal BEFORE any networking mutation. ExecStopPost replays cleanup.
+    if read_json(DATA / "session.json"):
+        raise Error("Previous session needs cleanup")
+    write_json(DATA / "session.json", session)
+    processes = []
+    stopped = False
+    def stop_signal(*_):
+        nonlocal stopped
+        stopped = True
+    signal.signal(signal.SIGTERM, stop_signal)
+    signal.signal(signal.SIGINT, stop_signal)
+    try:
+        lan = session.get("mode") == "lan"
+        prefix = [] if lan else ["/usr/bin/ip", "netns", "exec", NETNS]
+        if not lan:
+            bounded(["/usr/bin/nmcli", "device", "set", name, "managed", "no"])
+            ip("netns", "add", NETNS)
+            ip("link", "set", "dev", name, "netns", NETNS)
+            ip("-n", NETNS, "link", "set", "dev", name, "name", "pxe0")
+            ip("-n", NETNS, "address", "add", SERVER + "/24", "dev", "pxe0")
+            ip("-n", NETNS, "link", "set", "dev", "lo", "up")
+            ip("-n", NETNS, "link", "set", "dev", "pxe0", "up")
+        config = RUN / "dnsmasq.conf"
+        config.write_bytes(dnsmasq_config(session))
+        commands = [["/usr/bin/dnsmasq", "--keep-in-foreground", "--conf-file=" + str(config)],
+                    [LIBEXEC, "http"]]
+        for command in commands:
+            processes.append(subprocess.Popen([*prefix, *command],
+                                              env=ENV, start_new_session=True))
+        # Prove both the HTTP listener and DHCP daemon survive startup.
+        time.sleep(0.5)
+        bounded([*prefix, LIBEXEC, "probe"], timeout=10)
+        if any(p.poll() is not None for p in processes):
+            raise Error("A boot service failed to start; inspect journalctl -u pxe-dust")
+        if lan:
+            lan_unchanged(session)
+            firewall_install(session)
+        notify_ready()
+        next_check = time.monotonic()
+        while not stopped:
+            if lan and time.monotonic() >= next_check:
+                lan_unchanged(session)
+                next_check = time.monotonic() + 5
+            if any(p.poll() is not None for p in processes):
+                raise Error("A boot service exited; stopping the session")
+            time.sleep(0.25)
+    finally:
+        for proc in processes:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGTERM)
+        for proc in processes:
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait()
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+        cleanup()
+
+
+PUBLIC_ASSETS = {"/boot.ipxe": "boot.ipxe", "/vmlinuz": "vmlinuz", "/initramfs.img": "initramfs.img",
+                 "/arch/x86_64/airootfs.sfs": "airootfs.sfs",
+                 "/arch/x86_64/airootfs.sha512": "airootfs.sha512",
+                 "/arch/x86_64/airootfs.sfs.cms.sig": "airootfs.sfs.cms.sig"}
+
+
+def byte_range(header, size):
+    if not header:
+        return 0, size - 1
+    match = re.fullmatch(r"bytes=(\d{0,20})-(\d{0,20})", header)
+    if not match or not any(match.groups()) or size == 0:
+        raise Error("Invalid range")
+    first, last = match.groups()
+    if not first:
+        count = int(last)
+        if count == 0:
+            raise Error("Invalid range")
+        return max(0, size - count), size - 1
+    begin = int(first)
+    end = min(int(last), size - 1) if last else size - 1
+    if begin > end or begin >= size:
+        raise Error("Unsatisfiable range")
+    return begin, end
+
+
+class AssetHandler(http.server.BaseHTTPRequestHandler):
+    """Read-only allowlist: never expose directories, metadata, or user paths."""
+    server_version = "PXEDust"
+    sys_version = ""
+    def setup(self):
+        self.request.settimeout(15)
+        super().setup()
+    def log_message(self, *_):
+        pass  # Untrusted requests do not become journal spam.
+    def do_HEAD(self):
+        self.send_asset(head=True)
+    def do_GET(self):
+        self.send_asset()
+    def send_asset(self, head=False):
+        asset = PUBLIC_ASSETS.get(self.path)
+        if asset is None:
+            self.send_error(404)
+            return
+        if self.path == "/boot.ipxe" and hasattr(self.server, "boot_payload"):
+            payload = self.server.boot_payload
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if not head:
+                self.wfile.write(payload)
+            return
+        try:
+            fd = os.open(asset, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.server.asset_fd)
+        except OSError:
+            self.send_error(404)
+            return
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                self.send_error(404)
+                return
+            ranged = self.headers.get("Range") if not head else None
+            try:
+                begin, end = byte_range(ranged, info.st_size)
+            except Error:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{info.st_size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            length = end - begin + 1
+            self.send_response(206 if ranged else 200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Accept-Ranges", "bytes")
+            if ranged:
+                self.send_header("Content-Range", f"bytes {begin}-{end}/{info.st_size}")
+            self.send_header("Content-Length", str(length))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if not head:
+                deadline = time.monotonic() + 900
+                stream.seek(begin)
+                remaining = length
+                while remaining:
+                    if time.monotonic() > deadline:
+                        break
+                    chunk = stream.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+
+
+class AssetServer(socketserver.ForkingMixIn, http.server.HTTPServer):
+    max_children = 16
+    timeout = 1
+    block_on_close = False
+    def finish_request(self, request, client_address):
+        signal.alarm(930)  # Also bounds slow headers, before send_asset runs.
+        super().finish_request(request, client_address)
+    def handle_error(self, *_):
+        pass
+
+
+def http_serve():
+    session = read_json(DATA / "session.json")
+    meta = read_json(DATA / "image/metadata.json")
+    if not session or not meta:
+        raise Error("No active boot session or prepared image")
+    address = str(ipaddress.IPv4Address(session["server"]))
+    fd = trusted_dir(DATA / "image")
+    account = pwd.getpwnam("nobody")
+    os.setgroups([])
+    os.setgid(account.pw_gid)
+    os.setuid(account.pw_uid)
+    with AssetServer((address, PORT), AssetHandler) as server:
+        server.asset_fd = fd
+        server.boot_payload = boot_script(meta["signed_rootfs"], address)
+        server.serve_forever()
+
+
+def probe():
+    session = read_json(DATA / "session.json")
+    address = str(ipaddress.IPv4Address(session["server"]))
+    for _ in range(30):
+        try:
+            with socket.create_connection((address, PORT), timeout=0.2):
+                return
+        except OSError:
+            time.sleep(0.1)
+    raise Error("HTTP service did not become ready")
+
+
+def status():
+    image = read_json(DATA / "image/metadata.json")
+    session = read_json(DATA / "session.json")
+    try:
+        info = os.stat(LIBEXEC, follow_symlinks=False)
+        installed = stat.S_ISREG(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022
+    except FileNotFoundError:
+        installed = False
+    return {"version": VERSION, "installed": installed, "state": service_state(), "prepared": image is not None,
+            "sha256": image["sha256"] if image else "", "interface": session["interface"] if session else "",
+            "mode": session.get("mode", "dedicated") if session else "",
+            "server": session.get("server", SERVER) if session else "",
+            "interfaces": interfaces(), "missing": [p for p in REQUIRED if not os.access(p, os.X_OK)]
+            + ([] if IPXE.is_file() else [str(IPXE)])}
+
+
+def elevate(argv):
+    if os.geteuid() == 0:
+        return
+    info = os.stat(LIBEXEC, follow_symlinks=False)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise Error("Install the root-owned helper before using privileged actions")
+    os.execve("/usr/bin/pkexec", ["/usr/bin/pkexec", LIBEXEC, *argv], ENV)
+
+
+def uninstall():
+    receipt = read_json(DATA / "installation.json")
+    if not isinstance(receipt, dict) or set(receipt) != set(INSTALLED):
+        raise Error("Missing or invalid installation receipt; reinstall the reviewed version first")
+    held = []
+    try:
+        for path, expected in receipt.items():
+            target = Path(path)
+            parent = trusted_dir(target.parent)
+            held.append((parent, target.name))
+            fd = os.open(target.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            with os.fdopen(fd, "rb") as source:
+                info = os.fstat(source.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                    raise Error("Untrusted installed file; refusing removal")
+                raw = source.read(1024 * 1024 + 1)
+                if len(raw) > 1024 * 1024 or hashlib.sha256(raw).hexdigest() != expected:
+                    raise Error("Installed file was modified; refusing removal: " + path)
+        bounded(["/usr/bin/systemctl", "stop", UNIT], timeout=35)
+        cleanup()
+        bounded(["/usr/bin/systemctl", "disable", UNIT])
+        for parent, name in held:
+            os.unlink(name, dir_fd=parent)
+        (DATA / "installation.json").unlink()
+        bounded(["/usr/bin/systemctl", "daemon-reload"])
+    finally:
+        for parent, _ in held:
+            os.close(parent)
+    return {"ok": True, "message": "System component removed; image cache and journal retained"}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=VERSION)
+    sub = parser.add_subparsers(dest="action", required=True)
+    sub.add_parser("status", help="Read service, image and Ethernet status as JSON")
+    prep = sub.add_parser("prepare", help="Verify a local Omarchy ISO and cache its boot assets")
+    prep.add_argument("iso")
+    prep.add_argument("sha256")
+    begin = sub.add_parser("start", help="Serve on an existing LAN or a dedicated Ethernet network")
+    begin.add_argument("interface")
+    mode = begin.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dedicated", action="store_true", help="Supply addresses on a disconnected, dedicated adapter")
+    mode.add_argument("--lan", action="store_true", help="Use proxy DHCP on the existing LAN; keep the current connection")
+    sub.add_parser("stop", help="Stop boot services and restore the interface")
+    sub.add_parser("recover", help="Retry cleanup after a failed service stop")
+    sub.add_parser("uninstall", help="Stop and remove unchanged installed system files; keep image cache")
+    sub.add_parser("receipt", help="Generate installation hashes from this checkout (no system changes)")
+    for internal in ("serve", "cleanup", "http", "probe"):
+        sub.add_parser(internal, help="Internal system-service operation")
+    args = parser.parse_args(argv)
+    actual = list(sys.argv[1:] if argv is None else argv)
+    try:
+        if args.action == "receipt":
+            root = Path(__file__).resolve().parent.parent
+            result = {target: hashlib.sha256((root / source).read_bytes()).hexdigest()
+                      for target, source in INSTALLED.items()}
+        elif args.action == "status":
+            result = status()
+        else:
+            if args.action == "prepare":
+                # Resolve before pkexec changes cwd.
+                args.iso = os.path.abspath(args.iso)
+                actual = ["prepare", args.iso, args.sha256]
+            elevate(actual)
+            os.umask(0o022)
+            if args.action in ("serve", "cleanup", "http", "probe"):
+                {"serve": serve, "cleanup": cleanup, "http": http_serve, "probe": probe}[args.action]()
+                return 0
+            with mutation_lock():
+                if args.action == "prepare":
+                    result = prepare(args.iso, args.sha256)
+                elif args.action == "start":
+                    result = start(args.interface, args.dedicated, args.lan)
+                elif args.action == "stop":
+                    bounded(["/usr/bin/systemctl", "stop", UNIT], timeout=35)
+                    result = {"ok": True, "message": "Stopped"}
+                elif args.action == "uninstall":
+                    result = uninstall()
+                else:
+                    if service_state() not in ("inactive", "failed"):
+                        raise Error("Stop the service before recovery")
+                    cleanup()
+                    result = {"ok": True, "message": "Recovery complete"}
+        print(json.dumps(result))
+        return 0
+    except (Error, OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        print(json.dumps({"ok": False, "message": str(exc)[:1000]}))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

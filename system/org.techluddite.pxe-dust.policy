@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN" "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>PXE Dust</vendor>
+  <action id="org.techluddite.pxe-dust.manage">
+    <description>Manage the PXE Dust installation network</description>
+    <message>Authentication is required to prepare an image or manage PXE boot services and temporary firewall rules.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/libexec/pxe-dust</annotate>
+  </action>
+</policyconfig>

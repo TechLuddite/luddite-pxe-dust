@@ -1,0 +1,25 @@
+[Unit]
+Description=PXE Dust Omarchy network installation server
+After=NetworkManager.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/local/libexec/pxe-dust serve
+ExecStopPost=/usr/local/libexec/pxe-dust cleanup
+TimeoutStartSec=40
+TimeoutStopSec=20
+KillMode=control-group
+RuntimeDirectory=pxe-dust
+RuntimeDirectoryMode=0755
+UMask=0022
+Restart=no
+# ip netns creates a named bind mount that ExecStopPost must also see.
+# Do not add per-command filesystem namespaces (PrivateTmp/ProtectSystem).
+StandardOutput=journal
+StandardError=journal
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+
+[Install]
+WantedBy=multi-user.target
