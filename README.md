@@ -1,4 +1,4 @@
-# PXE Dust
+# Luddite PXE Dust
 
 Turn an Omarchy computer into a temporary Ethernet installation station.
 A Quattro bar panel prepares a verified Omarchy ISO and starts or stops a
@@ -24,10 +24,10 @@ Omarchy panel → authenticated helper → systemd service
 | Mode | Host connection | Address assignment | Host firewall |
 | --- | --- | --- | --- |
 | Existing LAN (default) | Stays connected on its current Ethernet interface | Existing router/DHCP server | Temporary rules scoped to the chosen interface and LAN |
-| Dedicated network | Selected disconnected adapter moves to an isolated namespace | PXE Dust supplies a private pool | Unchanged |
+| Dedicated network | Selected disconnected adapter moves to an isolated namespace | Luddite PXE Dust supplies a private pool | Unchanged |
 
 **Existing LAN:** select the connected adapter. It must have exactly one usable
-IPv4 address. PXE Dust leaves NetworkManager, addresses, routes and DNS alone.
+IPv4 address. Luddite PXE Dust leaves NetworkManager, addresses, routes and DNS alone.
 Dnsmasq provides only PXE boot information; it neither allocates addresses nor
 answers ordinary DHCP clients. HTTP binds to the adapter's current IPv4 address,
 and the iPXE script is generated for that address each session. If the address,
@@ -44,7 +44,7 @@ network ACLs may require separate administrator configuration. A firewall
 reload during a deployment can remove these temporary rules.
 
 **Dedicated network:** the selected adapter must be disconnected, down, and
-have no addresses or routes. PXE Dust temporarily removes it from NetworkManager
+have no addresses or routes. Luddite PXE Dust temporarily removes it from NetworkManager
 management, moves it into a network namespace, and assigns `192.168.173.1/24`.
 DHCP supplies `192.168.173.20–200`, with no router or DNS server. Stop returns
 the adapter in the down state and restores its prior management flag.
@@ -178,7 +178,7 @@ booted from the network enter the installer.
   snooping, VLAN boundaries, other PXE servers and firmware compatibility can
   affect discovery. Some networks require administrator changes.
 - **Port conflict:** stop any other service already using the selected address's
-  PXE/TFTP/HTTP ports; PXE Dust does not stop unrelated services.
+  PXE/TFTP/HTTP ports; Luddite PXE Dust does not stop unrelated services.
 - **Failed startup:** inspect `journalctl -u pxe-dust -b`. The helper checks that
   HTTP and dnsmasq remain running before reporting readiness.
 - **Incomplete cleanup:** stop the service, reconnect the original adapter if

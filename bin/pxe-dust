@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I
-"""PXE Dust: explicit, Omarchy netboot on an existing LAN or dedicated Ethernet link."""
+"""Luddite PXE Dust: explicit, Omarchy netboot on an existing LAN or dedicated Ethernet link."""
 import argparse
 import contextlib
 import fcntl
@@ -176,7 +176,7 @@ def mutation_lock():
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                raise Error("Another PXE Dust operation is in progress") from None
+                raise Error("Another Luddite PXE Dust operation is in progress") from None
             yield
         finally:
             os.close(lock)
@@ -260,7 +260,7 @@ def lan_unchanged(session):
     if len(rows) != 1 or rows[0].get("address") != session["address"] or rows[0].get("ifindex") != session["ifindex"]:
         raise Error("LAN adapter changed; stopping boot services")
     if lan_address(rows[0]) != (session["server"], session["network"]):
-        raise Error("LAN IPv4 address changed; restart PXE Dust to use the new address")
+        raise Error("LAN IPv4 address changed; restart Luddite PXE Dust to use the new address")
 
 
 def firewall_exists(*args):
@@ -333,7 +333,7 @@ def boot_script(signed, server=SERVER):
     verify = " cms_verify=y" if signed else ""
     return ("#!ipxe\n"
             f"set base http://{server}:{PORT}\n"
-            "echo Starting the Omarchy installer from PXE Dust\n"
+            "echo Starting the Omarchy installer from Luddite PXE Dust\n"
             "kernel ${base}/vmlinuz initrd=initramfs.img ip=dhcp "
             "archisobasedir=arch archiso_http_srv=${base}/ "
             f"initramfs_async=0{verify}\n"
@@ -359,7 +359,7 @@ def dnsmasq_config(session=None):
         network = ipaddress.IPv4Network(session["network"])
         config = f"dhcp-range={network.network_address},proxy,{network.netmask}\n"
         for arch in (7, 9):
-            config += f'pxe-service=tag:!ipxe,{arch},"PXE Dust",ipxe.efi,{server}\n'
+            config += f'pxe-service=tag:!ipxe,{arch},"Luddite PXE Dust",ipxe.efi,{server}\n'
             config += f'pxe-service=tag:ipxe,{arch},"Omarchy",http://{server}:{PORT}/boot.ipxe,{server}\n'
         return (common + config).encode()
     # The dedicated network supplies addresses but no router or DNS server.
@@ -463,7 +463,7 @@ def start(name, dedicated=False, lan=False):
         raise Error("Choose exactly one explicit mode: --lan or --dedicated")
     mode = "lan" if lan else "dedicated"
     if service_state() not in ("inactive", "failed"):
-        raise Error("PXE Dust is already starting or serving")
+        raise Error("Luddite PXE Dust is already starting or serving")
     if read_json(DATA / "image/metadata.json") is None:
         raise Error("Prepare an Omarchy ISO first")
     preflight(name, mode)
@@ -604,7 +604,7 @@ def byte_range(header, size):
 
 class AssetHandler(http.server.BaseHTTPRequestHandler):
     """Read-only allowlist: never expose directories, metadata, or user paths."""
-    server_version = "PXEDust"
+    server_version = "LudditePXEDust"
     sys_version = ""
     def setup(self):
         self.request.settimeout(15)

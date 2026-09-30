@@ -123,7 +123,7 @@ Ui.Panel {
         bar: root.bar
         text: root.serving ? "󰒍" : "󰛳"
         slotSize: Style.bar.statusSlot
-        tooltipText: root.serving ? "PXE Dust — serving" : "PXE Dust"
+        tooltipText: root.serving ? "Luddite PXE Dust — serving" : "Luddite PXE Dust"
         onPressed: root.toggle()
     }
     Ui.KeyboardPanel {
@@ -145,7 +145,7 @@ Ui.Panel {
             spacing: 12
             Keys.onEscapePressed: root.close()
             Text {
-                text: "PXE Dust"
+                text: "Luddite PXE Dust"
                 textFormat: Text.PlainText
                 color: Color.foreground
                 font.pixelSize: Style.font.display
@@ -163,7 +163,7 @@ Ui.Panel {
             Text {
                 width: parent.width
                 visible: !root.snapshot.installed || root.snapshot.missing.length > 0
-                text: "System setup required. Install dnsmasq, ipxe and the PXE Dust helper as described in the README."
+                text: "System setup required. Install dnsmasq, ipxe and the Luddite PXE Dust helper as described in the README."
                 textFormat: Text.PlainText
                 color: Color.foreground
                 wrapMode: Text.WordWrap
@@ -219,7 +219,7 @@ Ui.Panel {
             Text {
                 width: parent.width
                 text: root.networkMode === "lan"
-                    ? "Keep Ethernet connected. Your router supplies addresses; PXE Dust supplies boot information. Temporary firewall rules allow boot traffic from this LAN."
+                    ? "Keep Ethernet connected. Your router supplies addresses; Luddite PXE Dust supplies boot information. Temporary firewall rules allow boot traffic from this LAN."
                     : "Connect only installation targets to this adapter or its dedicated switch. Disconnect the adapter in Network settings first."
                 textFormat: Text.PlainText
                 color: Color.foreground

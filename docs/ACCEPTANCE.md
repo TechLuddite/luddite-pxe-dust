@@ -14,7 +14,7 @@ adapter model, router/DHCP implementation, and observed result.
 1. Confirm ordinary host internet access works, and record its addresses, routes,
    DNS and NetworkManager state. Start with `pxe-dust start INTERFACE --lan`.
 2. Confirm those values and internet connectivity remain unchanged. Inspect
-   DHCP packets: the router alone assigns addresses; PXE Dust responds only to
+   DHCP packets: the router alone assigns addresses; Luddite PXE Dust responds only to
    PXE clients with boot information. Test a second ordinary DHCP client too.
 3. Confirm the session's iptables chain permits boot traffic only through the
    selected interface, and that HTTP/TFTP destinations are the selected IPv4.

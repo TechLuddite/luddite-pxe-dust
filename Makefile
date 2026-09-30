@@ -10,7 +10,7 @@ check: test
 # Run as your normal user. Only the system install utility is elevated.
 # This deliberately does not install packages, enable the widget, or start DHCP.
 install:
-	@if systemctl is-active --quiet pxe-dust.service; then echo "Stop PXE Dust before installing an update." >&2; exit 1; fi
+	@if systemctl is-active --quiet pxe-dust.service; then echo "Stop Luddite PXE Dust before installing an update." >&2; exit 1; fi
 	sudo install -d -o root -g root -m 0755 /usr/local/libexec /usr/local/bin
 	sudo install -o root -g root -m 0755 bin/pxe-dust /usr/local/libexec/pxe-dust
 	sudo install -o root -g root -m 0755 bin/pxe-dust /usr/local/bin/pxe-dust
