@@ -82,10 +82,32 @@ make check
 make install
 ```
 
-`make install` uses `sudo install` to copy files; it does not run checkout code
-as root, install dependencies, enable a service, or start a network. Privileged
-runtime actions execute only `/usr/local/libexec/pxe-dust`, with an administrator
-authentication prompt. There is no passwordless privilege rule.
+Run `make install` as your normal user. Its transaction coordinator authenticates
+in the terminal and elevates only fixed system utilities, including `install`,
+`flock`, `timeout`, `mv`, `rm`, `rmdir`, `chmod`, `sync`, and `systemctl`.
+It does not execute checkout code as root, install dependencies, enable a service,
+or start a network. Privileged runtime actions execute only
+`/usr/local/libexec/pxe-dust`, with an administrator authentication prompt.
+There is no passwordless privilege rule.
+
+Installation holds the runtime operation lock and requires a successfully read
+service state of `inactive` or `failed`. Starting, stopping, active, and unknown
+states are refused. It stages and verifies all files and the installation
+receipt before replacing anything, refuses unowned or modified installed files,
+requires installed files to remain owned by `root:root`, and restores the previous
+files and modes if publication or systemd reload fails.
+Root receives source files through already-open descriptors rather than reopening
+user-owned paths. The lock serializes plugin and CLI operations; separate
+administrator commands must not start the service during installation.
+
+A forced kill, power loss, or failed rollback can leave
+`/var/lib/pxe-dust/installation-pending.json` and retained backups. The marker
+lists the affected paths and old/new hashes. Installation, image preparation,
+uninstallation, and new serving actions refuse that marker; stop and network
+recovery remain available. Inspect and restore the recorded files, reload
+systemd, and remove the marker only after verifying a coherent installation.
+Do not delete the marker merely to bypass the check. A kill before the journal
+is published can leave unused staging directories without replacing installed files.
 
 For local development, copy this repository into
 `~/.config/omarchy/plugins/techluddite.pxe-dust`, then run:
@@ -196,8 +218,22 @@ booted from the network enter the installer.
   HTTP and dnsmasq remain running before reporting readiness.
 - **Incomplete cleanup:** stop the service, reconnect the original adapter if
   it was unplugged, then run `pxe-dust recover`. It refuses to restore management
-  to a replacement adapter with a different identity. In LAN mode, recovery
-  retries removal of the session firewall rules without changing the adapter.
+  to a replacement adapter with a different identity. New dedicated sessions
+  also require the recorded kernel interface index; reconnecting an adapter can
+  change that index and require administrator inspection of the retained journal.
+  In LAN mode, recovery retries removal of the session firewall rules without
+  changing the adapter.
+- **Dedicated adapter changed during startup:** the helper checks identity,
+  addresses, routes and management state around the transition. If an adapter
+  becomes active after moving into the namespace, or gains unrelated addresses,
+  it retains the namespace and recovery journal rather than flushing that state.
+  Inspect the recorded adapter and deliberately disconnect it in the owned
+  namespace before retrying recovery. A namespace whose ownership was not
+  recorded, or whose identity changed, requires administrator inspection.
+  These checks cannot make unrelated administrator network commands atomic.
+- **Interrupted system installation:** inspect
+  `/var/lib/pxe-dust/installation-pending.json` and its recorded backups. Restore
+  a coherent installation before removing the marker and rerunning `make install`.
 - **Interrupted image replacement:** inspect `/var/lib/pxe-dust/previous-image`.
   It is deliberately retained rather than silently deleted on the next attempt.
 - **No boot:** check UEFI IPv4 PXE, Secure Boot, cable/link, and target RAM. Real
@@ -222,6 +258,11 @@ Runtime data:
 - `/var/lib/pxe-dust/` — root-owned image cache, operation lock, requested
   interface, installation receipt and recovery journal. Image metadata includes
   its digest and size.
+- `/var/lib/pxe-dust/installation-pending.json` — temporary installation journal;
+  retained when an interrupted transaction needs inspection.
+- `.pxe-dust-install-<random id>/` beside installed destinations — root-owned
+  staging and backup files, removed after successful installation or rollback;
+  interrupted transactions can retain them for recovery.
 - `/run/pxe-dust/` — generated dnsmasq configuration, removed by systemd.
 - `/run/netns/pxe-dust` — dedicated mode only; removed on cleanup.
 - `PXDUST_<random suffix>` — LAN mode's temporary IPv4 iptables chain and INPUT
@@ -277,6 +318,9 @@ that an explicit boot interface obtains a lease. It uses private mount
 namespaces for sysfs and DHCP output files and never starts a host service.
 See [hardware acceptance](docs/ACCEPTANCE.md) for the deployment checks still
 needed before calling this production-ready.
+See [contributor guidance](docs/CONTRIBUTING.md) for implementation constraints
+and the scope of the observed hardware evidence. Keep automatically loaded
+agent instructions outside the distributed plugin checkout.
 
 Boot parameters follow the upstream
 [Arch HTTP hook](https://gitlab.archlinux.org/archlinux/mkinitcpio/mkinitcpio-archiso/-/blob/master/hooks/archiso_pxe_http).

@@ -1,4 +1,4 @@
-# Project context
+# Contributing
 
 Luddite PXE Dust is an Omarchy Quattro bar widget with a Python system helper.
 Read `README.md` for installation and networking behavior, and

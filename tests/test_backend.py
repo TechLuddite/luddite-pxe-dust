@@ -277,6 +277,271 @@ class LifecycleTests(unittest.TestCase):
 
 
 
+class DedicatedTransitionTests(unittest.TestCase):
+    """Model external connection changes at the dedicated ownership boundary."""
+
+    @contextlib.contextmanager
+    def network(self, managed=True):
+        self.session = {"mode": "dedicated", "interface": "enp1s0", "ifindex": 3,
+                        "address": "02:00:00:00:00:01", "managed": managed,
+                        "transition_version": 1, "nm_restore": False, "move_intent": False}
+        self.host = {"ifname": "enp1s0", "ifindex": 3, "address": self.session["address"],
+                     "link_type": "ether", "flags": [], "addr_info": []}
+        self.moved = None
+        self.ns = None
+        self.managed = managed
+        self.routes = {"-4": [], "-6": []}
+        self.journal = dict(self.session)
+        self.commands = []
+        self.after_nm = lambda: None
+        self.after_ip = lambda args: None
+
+        def command(argv, **_):
+            self.commands.append(tuple(argv))
+            if "GENERAL.NM-MANAGED" in argv:
+                return b"yes" if self.managed else b"no"
+            self.managed = argv[-1] == "yes"
+            self.after_nm()
+            return b""
+
+        def ip(*args):
+            self.commands.append(args)
+            prefix = args[:2] == ("-n", dust.NETNS)
+            parts = args[2:] if prefix else args
+            row = self.moved if prefix else self.host
+            if "-j" in parts:
+                if "route" in parts:
+                    return json.dumps(self.routes[parts[1]]).encode()
+                if prefix and parts == ("-j", "link", "show"):
+                    rows = [{"ifname": "lo"}] + ([row] if row else [])
+                else:
+                    rows = [row] if row else []
+                return json.dumps(rows).encode()
+            if parts == ("netns", "add", dust.NETNS):
+                self.ns = [1, 42]
+            elif parts == ("netns", "delete", dust.NETNS):
+                self.ns = None
+            elif parts[:2] == ("link", "set"):
+                if "netns" in parts:
+                    if prefix:
+                        self.host, self.moved = self.moved, None
+                    else:
+                        self.moved, self.host = self.host, None
+                elif "name" in parts:
+                    row["ifname"] = parts[-1]
+                elif parts[3] != "lo":
+                    row["flags"] = ["UP"] if parts[-1] == "up" else []
+            elif parts[:2] == ("address", "add"):
+                row["addr_info"] = [{"family": "inet", "local": dust.SERVER, "prefixlen": 24}]
+            elif parts[:2] == ("address", "flush"):
+                row["addr_info"] = []
+            self.after_ip(args)
+            return b""
+
+        def write(_path, value):
+            self.journal = json.loads(json.dumps(value))
+
+        def exists(path):
+            return path.name == "device" or (path == Path("/run/netns", dust.NETNS) and self.ns is not None)
+
+        with patch.object(dust, "ip", side_effect=ip), \
+             patch.object(dust, "bounded", side_effect=command), \
+             patch.object(dust, "write_json", side_effect=write), \
+             patch.object(dust, "read_json", side_effect=lambda _: self.journal), \
+             patch.object(dust, "namespace_identity", side_effect=lambda: self.ns), \
+             patch.object(Path, "exists", autospec=True, side_effect=exists), \
+             patch.object(Path, "unlink") as unlink:
+            self.unlink = unlink
+            yield
+
+    def assert_no_adapter_mutation(self):
+        self.assertFalse(any("set" in x or "flush" in x for x in self.commands))
+
+    def test_connection_activated_after_preflight_is_not_repurposed(self):
+        with self.network():
+            self.host["flags"] = ["UP"]
+            with self.assertRaisesRegex(dust.Error, "became active"):
+                dust.dedicated_takeover(self.session)
+            dust.cleanup()
+            self.assert_no_adapter_mutation()
+            self.unlink.assert_called_once()
+
+    def test_replaced_same_mac_adapter_is_refused_before_nm_mutation(self):
+        with self.network():
+            self.host["ifindex"] = 99
+            with self.assertRaisesRegex(dust.Error, "identity changed"):
+                dust.dedicated_takeover(self.session)
+            self.assert_no_adapter_mutation()
+
+    def test_management_change_is_refused_before_nm_mutation(self):
+        with self.network():
+            self.managed = False
+            with self.assertRaisesRegex(dust.Error, "management state changed"):
+                dust.dedicated_takeover(self.session)
+            self.assert_no_adapter_mutation()
+
+    def test_activation_during_nm_intent_journal_does_not_restore_or_move_connection(self):
+        with self.network():
+            record = dust.write_json.side_effect
+            def activate(path, value):
+                record(path, value)
+                if value.get("nm_restore"):
+                    self.host["flags"] = ["UP"]
+            dust.write_json.side_effect = activate
+            with self.assertRaisesRegex(dust.Error, "became active"):
+                dust.dedicated_takeover(self.session)
+            dust.cleanup()
+            self.assert_no_adapter_mutation()
+            self.assertTrue(self.managed)
+            self.unlink.assert_called_once()
+
+    def test_activation_during_move_intent_journal_prevents_actual_move(self):
+        with self.network():
+            record = dust.write_json.side_effect
+            def activate(path, value):
+                record(path, value)
+                if value.get("move_intent"):
+                    self.host["flags"] = ["UP"]
+            dust.write_json.side_effect = activate
+            with self.assertRaisesRegex(dust.Error, "became active"):
+                dust.dedicated_takeover(self.session)
+            self.assertIsNotNone(self.host)
+            self.assertIsNone(self.moved)
+            with self.assertRaisesRegex(dust.Error, "became active"):
+                dust.cleanup()
+            self.assertFalse(any("flush" in x for x in self.commands))
+
+    def test_nm_timeout_after_applying_unmanaged_still_restores_idle_original(self):
+        with self.network():
+            def timeout():
+                raise dust.Error("simulated nmcli timeout")
+            self.after_nm = timeout
+            with self.assertRaisesRegex(dust.Error, "timeout"):
+                dust.dedicated_takeover(self.session)
+            self.assertFalse(self.managed)
+            self.after_nm = lambda: None
+            dust.cleanup()
+            self.assertTrue(self.managed)
+            self.unlink.assert_called_once()
+
+    def test_adapter_activation_after_unmanaged_preserves_connection_and_recovery(self):
+        with self.network():
+            self.after_nm = lambda: self.host.update(flags=["UP"], addr_info=[{"local": "192.0.2.5"}])
+            with self.assertRaisesRegex(dust.Error, "became active"):
+                dust.dedicated_takeover(self.session)
+            with self.assertRaisesRegex(dust.Error, "became active"):
+                dust.cleanup()
+            self.assertFalse(any("netns" in x or "flush" in x for x in self.commands))
+            self.assertFalse(self.managed)
+            self.unlink.assert_not_called()
+            self.host.update(flags=[], addr_info=[])
+            self.after_nm = lambda: None
+            dust.cleanup()
+            self.assertTrue(self.managed)
+            self.unlink.assert_called_once()
+
+    def test_routes_added_after_unmanaged_prevent_move(self):
+        for family in ("-4", "-6"):
+            with self.subTest(family=family), self.network():
+                self.after_nm = lambda: self.routes[family].append({"dst": "default"})
+                with self.assertRaisesRegex(dust.Error, "has routes"):
+                    dust.dedicated_takeover(self.session)
+                self.assertIsNone(self.ns)
+                self.assertIsNotNone(self.host)
+
+    def test_activation_during_namespace_creation_prevents_move(self):
+        with self.network():
+            def change(args):
+                if args == ("netns", "add", dust.NETNS):
+                    self.host["flags"] = ["UP"]
+            self.after_ip = change
+            with self.assertRaisesRegex(dust.Error, "became active"):
+                dust.dedicated_takeover(self.session)
+            with self.assertRaisesRegex(dust.Error, "became active"):
+                dust.cleanup()
+            self.assertIsNotNone(self.host)
+            self.assertIsNone(self.ns)
+            self.assertFalse(any("flush" in x for x in self.commands))
+            self.unlink.assert_not_called()
+
+    def test_activation_during_move_is_not_flushed_or_reconfigured(self):
+        with self.network():
+            def change(args):
+                if args == ("link", "set", "dev", "enp1s0", "netns", dust.NETNS):
+                    self.moved.update(flags=["UP"], addr_info=[{"local": "192.0.2.5"}])
+            self.after_ip = change
+            with self.assertRaisesRegex(dust.Error, "became active"):
+                dust.dedicated_takeover(self.session)
+            self.commands.clear()
+            with self.assertRaisesRegex(dust.Error, "became active"):
+                dust.cleanup()
+            self.assert_no_adapter_mutation()
+            self.assertEqual(self.moved["addr_info"], [{"local": "192.0.2.5"}])
+            self.assertIsNotNone(self.ns)
+            self.unlink.assert_not_called()
+
+    def test_successful_takeover_returns_adapter_and_original_management(self):
+        for managed in (True, False):
+            with self.subTest(managed=managed), self.network(managed):
+                dust.dedicated_takeover(self.session)
+                self.assertIsNone(self.host)
+                self.assertEqual(self.moved["ifname"], "pxe0")
+                self.assertFalse(self.managed)
+                dust.cleanup()
+                self.assertIsNone(self.ns)
+                self.assertEqual(self.host["ifname"], "enp1s0")
+                self.assertEqual(self.host["flags"], [])
+                self.assertEqual(self.host["addr_info"], [])
+                self.assertEqual(self.managed, managed)
+                self.unlink.assert_called_once()
+
+    def test_unrelated_namespace_after_preflight_is_never_touched(self):
+        with self.network():
+            self.ns = [1, 99]
+            dust.cleanup()
+            self.assertEqual(self.ns, [1, 99])
+            self.assertEqual(self.commands, [])
+
+    def test_replaced_owned_namespace_preserves_recovery_and_all_links(self):
+        with self.network():
+            dust.dedicated_takeover(self.session)
+            self.ns = [1, 99]
+            self.commands.clear()
+            with self.assertRaisesRegex(dust.Error, "namespace identity changed"):
+                dust.cleanup()
+            self.assertEqual(self.commands, [])
+            self.unlink.assert_not_called()
+
+    def test_crash_before_namespace_ownership_write_never_deletes_unproven_namespace(self):
+        with self.network():
+            self.journal["namespace_intent"] = True
+            self.ns = [1, 99]
+            with self.assertRaisesRegex(dust.Error, "ownership was not recorded"):
+                dust.cleanup()
+            self.assertEqual(self.commands, [])
+            self.unlink.assert_not_called()
+
+    def test_recovery_refuses_replacement_adapter_after_nm_change(self):
+        with self.network():
+            self.journal["nm_restore"] = True
+            self.managed = False
+            self.host["ifindex"] = 99
+            with self.assertRaisesRegex(dust.Error, "missing or changed"):
+                dust.cleanup()
+            self.assert_no_adapter_mutation()
+            self.unlink.assert_not_called()
+
+    def test_unrelated_address_in_owned_namespace_is_preserved(self):
+        with self.network():
+            dust.dedicated_takeover(self.session)
+            self.moved["addr_info"].append({"family": "inet", "local": "192.0.2.5", "prefixlen": 24})
+            self.commands.clear()
+            with self.assertRaisesRegex(dust.Error, "unrelated addresses"):
+                dust.cleanup()
+            self.assert_no_adapter_mutation()
+            self.unlink.assert_not_called()
+
+
 class LANTests(unittest.TestCase):
     def row(self, address='192.0.2.10'):
         return {'ifname': 'enp1s0', 'ifindex': 3, 'address': '02:00:00:00:00:01',

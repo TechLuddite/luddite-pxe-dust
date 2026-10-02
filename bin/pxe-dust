@@ -241,6 +241,72 @@ def preflight(name, mode="dedicated"):
             "managed": managed == b"yes", "server": SERVER, "network": NETWORK}
 
 
+def nm_managed(name):
+    managed = bounded(["/usr/bin/nmcli", "-g", "GENERAL.NM-MANAGED", "device", "show", name]).strip()
+    if managed not in (b"yes", b"no"):
+        raise Error("Cannot determine NetworkManager management state")
+    return managed == b"yes"
+
+
+def dedicated_unchanged(session, namespace=False, managed=None, name=None):
+    """Refuse a changed or active adapter at each ownership transition."""
+    name = name or session["interface"]
+    prefix = ("-n", NETNS) if namespace else ()
+    rows = json.loads(ip(*prefix, "-j", "address", "show", "dev", name))
+    if (len(rows) != 1 or rows[0].get("address") != session["address"]
+            or rows[0].get("ifindex") != session["ifindex"]):
+        raise Error("Dedicated adapter identity changed; refusing to repurpose it")
+    row = rows[0]
+    if row.get("link_type") != "ether" or row.get("master") or row.get("linkinfo"):
+        raise Error("Select a physical Ethernet interface")
+    if not namespace and (Path("/sys/class/net", name, "wireless").exists()
+                          or not Path("/sys/class/net", name, "device").exists()):
+        raise Error("Dedicated network mode requires a physical Ethernet interface")
+    if "UP" in row.get("flags", []) or row.get("addr_info"):
+        raise Error("Dedicated adapter became active; refusing to repurpose it")
+    for family in ("-4", "-6"):
+        if json.loads(ip(*prefix, "-j", family, "route", "show", "table", "all", "dev", name)):
+            raise Error("Dedicated adapter has routes; refusing to repurpose it")
+    if managed is not None and nm_managed(name) != managed:
+        raise Error("NetworkManager management state changed; retry after disconnecting the adapter")
+
+
+def namespace_identity():
+    info = Path("/run/netns", NETNS).stat()
+    return [info.st_dev, info.st_ino]
+
+
+def dedicated_takeover(session):
+    dedicated_unchanged(session, managed=session["managed"])
+    if session["managed"]:
+        # Record intent before nmcli: even a timeout may have changed management.
+        session["nm_restore"] = True
+        write_json(DATA / "session.json", session)
+        dedicated_unchanged(session, managed=True)
+        bounded(["/usr/bin/nmcli", "device", "set", session["interface"], "managed", "no"])
+    dedicated_unchanged(session, managed=False)
+    session["namespace_intent"] = True
+    write_json(DATA / "session.json", session)
+    ip("netns", "add", NETNS)
+    # A crash before this write leaves an unproven namespace untouched. Recovery
+    # refuses it rather than deleting a namespace it cannot establish ownership of.
+    session["namespace_identity"] = namespace_identity()
+    write_json(DATA / "session.json", session)
+    dedicated_unchanged(session, managed=False)
+    session["move_intent"] = True
+    write_json(DATA / "session.json", session)
+    dedicated_unchanged(session, managed=False)
+    ip("link", "set", "dev", session["interface"], "netns", NETNS)
+    dedicated_unchanged(session, namespace=True)
+    session["configuration_intent"] = True
+    write_json(DATA / "session.json", session)
+    dedicated_unchanged(session, namespace=True)
+    ip("-n", NETNS, "link", "set", "dev", session["interface"], "name", "pxe0")
+    ip("-n", NETNS, "address", "add", SERVER + "/24", "dev", "pxe0")
+    ip("-n", NETNS, "link", "set", "dev", "lo", "up")
+    ip("-n", NETNS, "link", "set", "dev", "pxe0", "up")
+
+
 def lan_address(row):
     if "UP" not in row.get("flags", []):
         raise Error("Existing LAN mode needs a connected network interface")
@@ -491,6 +557,10 @@ def cleanup():
         firewall_cleanup(session)
         (DATA / "session.json").unlink()
         return
+    if session.get("transition_version") == 1:
+        dedicated_cleanup(session)
+        (DATA / "session.json").unlink()
+        return
     if Path("/run/netns", NETNS).exists():
         links = json.loads(ip("-n", NETNS, "-j", "link", "show"))
         candidates = [x for x in links if x["ifname"] in ("pxe0", name)]
@@ -512,6 +582,58 @@ def cleanup():
     (DATA / "session.json").unlink()
 
 
+def dedicated_cleanup(session):
+    """Undo only mutations established by this session's transition journal."""
+    name = interface_name(session["interface"])
+    if session.get("namespace_identity") and Path("/run/netns", NETNS).exists():
+        if namespace_identity() != session["namespace_identity"]:
+            raise Error("PXE namespace identity changed; refusing cleanup")
+        links = json.loads(ip("-n", NETNS, "-j", "link", "show"))
+        candidates = [x for x in links if x["ifname"] != "lo"]
+        if candidates:
+            if (not session.get("move_intent") or len(candidates) != 1
+                    or candidates[0]["ifname"] not in ("pxe0", name)
+                    or candidates[0].get("address") != session["address"]
+                    or candidates[0].get("ifindex") != session["ifindex"]):
+                raise Error("Deployment interface identity changed; refusing cleanup")
+            current = candidates[0]["ifname"]
+            rows = json.loads(ip("-n", NETNS, "-j", "address", "show", "dev", current))
+            if (len(rows) != 1 or rows[0].get("address") != session["address"]
+                    or rows[0].get("ifindex") != session["ifindex"]):
+                raise Error("Deployment interface identity changed; refusing cleanup")
+            addresses = rows[0].get("addr_info", [])
+            def own_address(address):
+                return (address.get("family") == "inet" and address.get("local") == SERVER
+                        and address.get("prefixlen") == 24)
+            if session.get("configuration_intent") and any(own_address(a) for a in addresses):
+                if any(not own_address(a) and not (a.get("family") == "inet6" and a.get("scope") == "link")
+                       for a in addresses):
+                    raise Error("Deployment interface has unrelated addresses; refusing cleanup")
+            else:
+                # An adapter that became active during the move was never ours
+                # to configure. Preserve it and require explicit recovery.
+                dedicated_unchanged(session, namespace=True, name=current)
+            ip("-n", NETNS, "link", "set", "dev", current, "down")
+            ip("-n", NETNS, "address", "flush", "dev", current)
+            if current != name:
+                ip("-n", NETNS, "link", "set", "dev", current, "name", name)
+            ip("-n", NETNS, "link", "set", "dev", name, "netns", "1")
+        ip("netns", "delete", NETNS)
+    elif session.get("namespace_intent") and not session.get("namespace_identity") and Path("/run/netns", NETNS).exists():
+        raise Error("PXE namespace ownership was not recorded; refusing cleanup")
+    if not session.get("nm_restore"):
+        return
+    rows = json.loads(ip("-j", "link", "show", "dev", name))
+    if (len(rows) != 1 or rows[0].get("address") != session["address"]
+            or rows[0].get("ifindex") != session["ifindex"]):
+        raise Error("Original interface is missing or changed; reconnect it and run recover")
+    if not nm_managed(name):
+        # Before a move, a failed recheck may mean another actor connected the
+        # adapter. Do not hand such a live connection back to NetworkManager.
+        dedicated_unchanged(session)
+        bounded(["/usr/bin/nmcli", "device", "set", name, "managed", "yes"])
+
+
 def serve():
     request = read_json(DATA / "request.json")
     if not request:
@@ -521,6 +643,8 @@ def serve():
     # Journal BEFORE any networking mutation. ExecStopPost replays cleanup.
     if read_json(DATA / "session.json"):
         raise Error("Previous session needs cleanup")
+    if session.get("mode") != "lan":
+        session.update(transition_version=1, nm_restore=False, move_intent=False)
     write_json(DATA / "session.json", session)
     processes = []
     stopped = False
@@ -533,13 +657,7 @@ def serve():
         lan = session.get("mode") == "lan"
         prefix = [] if lan else ["/usr/bin/ip", "netns", "exec", NETNS]
         if not lan:
-            bounded(["/usr/bin/nmcli", "device", "set", name, "managed", "no"])
-            ip("netns", "add", NETNS)
-            ip("link", "set", "dev", name, "netns", NETNS)
-            ip("-n", NETNS, "link", "set", "dev", name, "name", "pxe0")
-            ip("-n", NETNS, "address", "add", SERVER + "/24", "dev", "pxe0")
-            ip("-n", NETNS, "link", "set", "dev", "lo", "up")
-            ip("-n", NETNS, "link", "set", "dev", "pxe0", "up")
+            dedicated_takeover(session)
         config = RUN / "dnsmasq.conf"
         config.write_bytes(dnsmasq_config(session))
         commands = [["/usr/bin/dnsmasq", "--keep-in-foreground", "--conf-file=" + str(config)],
@@ -770,6 +888,15 @@ def uninstall():
     return {"ok": True, "message": "System component removed; image cache and journal retained"}
 
 
+def installation_ready():
+    """An interrupted file transaction must be reviewed before runtime use."""
+    absent = object()
+    if read_json(DATA / "installation-pending.json", default=absent) is not absent:
+        raise Error("Interrupted system installation requires review: "
+                    "/var/lib/pxe-dust/installation-pending.json; "
+                    "restore the retained installation backups before retrying")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", action="version", version=VERSION)
@@ -806,9 +933,13 @@ def main(argv=None):
             elevate(actual)
             os.umask(0o022)
             if args.action in ("serve", "cleanup", "http", "probe"):
+                if args.action != "cleanup":
+                    installation_ready()
                 {"serve": serve, "cleanup": cleanup, "http": http_serve, "probe": probe}[args.action]()
                 return 0
             with mutation_lock():
+                if args.action in ("prepare", "start", "uninstall"):
+                    installation_ready()
                 if args.action == "prepare":
                     result = prepare(args.iso, args.sha256)
                 elif args.action == "start":
