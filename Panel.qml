@@ -14,12 +14,16 @@ Ui.Panel {
     property var snapshot: ({state: "unknown", installed: false, prepared: false, interfaces: [], missing: []})
     property string message: ""
     property int selected: 0
-    property string networkMode: "lan"
+    property string networkMode: root.setting("networkMode", "lan")
     property bool acknowledged: false
     readonly property bool busy: action.running
     readonly property bool serving: snapshot.state === "active"
-    readonly property string interfaceName: snapshot.interfaces.length > selected
-        ? snapshot.interfaces[selected].name : ""
+    readonly property var availableInterfaces: snapshot.interfaces.filter(function(x) {
+        return root.networkMode === "lan" || !x.wireless
+    })
+    readonly property string interfaceName: availableInterfaces.length > selected
+        ? availableInterfaces[selected].name : ""
+    onNetworkModeChanged: { selected = 0; acknowledged = false }
     readonly property string helper: Qt.resolvedUrl("bin/pxe-dust").toString().replace(/^file:\/\//, "")
 
     function refresh() {
@@ -47,9 +51,12 @@ Ui.Panel {
             for (var i = 0; i < s.interfaces.length; i++) {
                 if (typeof s.interfaces[i].name !== "string"
                     || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$/.test(s.interfaces[i].name)) return
+                if (s.interfaces[i].wireless !== undefined && typeof s.interfaces[i].wireless !== "boolean") return
             }
             var previous = root.interfaceName
-            var next = s.interfaces.findIndex(function(x) { return x.name === previous })
+            var mode = s.state === "active" ? s.mode : root.networkMode
+            var eligible = s.interfaces.filter(function(x) { return mode === "lan" || !x.wireless })
+            var next = eligible.findIndex(function(x) { return x.name === previous })
             root.snapshot = s
             if (s.state === "active") root.networkMode = s.mode
             root.selected = next >= 0 ? next : 0
@@ -154,7 +161,7 @@ Ui.Panel {
                 width: parent.width
                 text: root.serving
                     ? (root.snapshot.mode === "lan" ? "Serving on your existing LAN" : "Serving on the dedicated network")
-                    : "Your Ethernet installation station"
+                    : "Your network installation station"
                 textFormat: Text.PlainText
                 color: root.serving ? Color.accent : Color.foreground
                 font.pixelSize: Style.font.body
@@ -177,6 +184,7 @@ Ui.Panel {
                 id: iso
                 width: parent.width
                 label: "Local ISO path"
+                text: root.setting("isoPath", "")
                 placeholder: "/path/to/omarchy.iso"
                 visible: !root.serving
                 enabled: !root.busy
@@ -185,6 +193,7 @@ Ui.Panel {
                 id: checksum
                 width: parent.width
                 label: "Published SHA-256"
+                text: root.setting("sha256", "")
                 placeholder: "64 hexadecimal characters"
                 maximumLength: 64
                 visible: !root.serving
@@ -209,17 +218,18 @@ Ui.Panel {
                 }
             }
             Ui.Button {
-                text: root.serving ? "Ethernet: " + root.snapshot.interface
-                    : (root.interfaceName ? "Ethernet: " + root.interfaceName + "  ›" : "No Ethernet interface detected")
-                enabled: !root.serving && !root.busy && root.snapshot.interfaces.length > 0
+                text: root.serving ? "Interface: " + root.snapshot.interface
+                    : (root.interfaceName ? "Interface: " + root.interfaceName + "  ›"
+                        : (root.networkMode === "lan" ? "No Ethernet or Wi-Fi interface detected" : "No Ethernet interface detected"))
+                enabled: !root.serving && !root.busy && root.availableInterfaces.length > 0
                 focusable: true
                 bordered: true
-                onClicked: { root.selected = (root.selected + 1) % root.snapshot.interfaces.length; root.acknowledged = false }
+                onClicked: { root.selected = (root.selected + 1) % root.availableInterfaces.length; root.acknowledged = false }
             }
             Text {
                 width: parent.width
                 text: root.networkMode === "lan"
-                    ? "Keep Ethernet connected. Your router supplies addresses; Luddite PXE Dust supplies boot information. Temporary firewall rules allow boot traffic from this LAN."
+                    ? "Keep this interface connected. Your router supplies addresses; Luddite PXE Dust supplies boot information. With a Wi-Fi host, the access point must bridge wired clients to this LAN and allow DHCP/PXE traffic. Temporary firewall rules allow boot traffic from this LAN."
                     : "Connect only installation targets to this adapter or its dedicated switch. Disconnect the adapter in Network settings first."
                 textFormat: Text.PlainText
                 color: Color.foreground

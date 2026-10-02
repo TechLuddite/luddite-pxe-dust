@@ -4,12 +4,16 @@ Turn an Omarchy computer into a temporary Ethernet installation station.
 A Quattro bar panel prepares a verified Omarchy ISO and starts or stops a
 UEFI x86-64 PXE server. Targets run the normal interactive installer.
 
-**Version 0.2 is experimental.** One Ethernet interface is enough: the default
-**Existing LAN** mode keeps the host connected and uses proxy DHCP alongside
-your router. The original **Dedicated network** mode is also available.
+**Version 0.2 is experimental.** One Ethernet or Wi-Fi host interface is enough:
+the default **Existing LAN** mode keeps the host connected and uses proxy DHCP
+alongside your router. The original **Dedicated network** mode is also available.
 A complete installation on physical hardware is still required. Unattended disk
-selection, BIOS boot, ARM, Wi-Fi PXE, internet sharing and Secure Boot are not
-included.
+selection, BIOS boot, ARM, Wi-Fi client PXE, internet sharing and Secure Boot
+are not included.
+
+A Wi-Fi host and wired UEFI desktop on an existing LAN have successfully booted
+Omarchy 4.0.4 into the full interactive installer. Installation to disk was
+deliberately deferred. See [observed hardware results](docs/ACCEPTANCE.md).
 
 ## How it works
 
@@ -23,7 +27,7 @@ Omarchy panel → authenticated helper → systemd service
 
 | Mode | Host connection | Address assignment | Host firewall |
 | --- | --- | --- | --- |
-| Existing LAN (default) | Stays connected on its current Ethernet interface | Existing router/DHCP server | Temporary rules scoped to the chosen interface and LAN |
+| Existing LAN (default) | Stays connected on its current Ethernet or Wi-Fi interface | Existing router/DHCP server | Temporary rules scoped to the chosen interface and LAN |
 | Dedicated network | Selected disconnected adapter moves to an isolated namespace | Luddite PXE Dust supplies a private pool | Unchanged |
 
 **Existing LAN:** select the connected adapter. It must have exactly one usable
@@ -51,6 +55,8 @@ the adapter in the down state and restores its prior management flag.
 
 Both modes use the distribution's iPXE EFI binary and HTTP port 8080. A systemd
 stop hook retries cleanup after a crash. The service is not enabled at boot.
+The boot script passes the active iPXE NIC's MAC as `BOOTIF`; the ISO's early
+network hook uses it to select the same Linux interface for DHCP.
 Reloading or removing the widget does not stop an active deployment;
 `pxe-dust stop` remains available independently of the widget.
 
@@ -58,9 +64,10 @@ Reloading or removing the widget does not stop an active deployment;
 
 Requirements: Omarchy Quattro, Python 3, systemd, NetworkManager, polkit,
 iproute2, libarchive (`bsdtar`), dnsmasq, and ipxe. Existing LAN mode also requires
-iptables. A single physical Ethernet adapter connected to your router or switch
-is sufficient. Targets need UEFI IPv4 network boot on the same LAN/broadcast
-domain. A second host adapter is only useful for the optional dedicated mode.
+iptables. A physical Ethernet adapter or a connected Wi-Fi adapter on the same
+LAN is sufficient for the host. Targets need UEFI IPv4 network boot on the same
+LAN/broadcast domain. A second host adapter is only useful for the optional
+dedicated mode.
 
 Install the missing distribution packages explicitly:
 
@@ -124,8 +131,13 @@ RAM for the full squashfs plus the running installer. Start validation on a
 
 ## Serve
 
-For a host with one Ethernet interface, leave it connected to your router or
-switch. In the panel, keep **Mode: Existing LAN**, select the adapter, acknowledge
+For an Ethernet host, leave it connected to your router or switch. A Wi-Fi
+host can use its existing connection if the access point bridges Wi-Fi and
+the wired target network into the same broadcast domain. Guest networks,
+client isolation, VLAN separation, or DHCP/PXE filtering can prevent discovery
+or transfers. This does not add Wi-Fi network boot to target firmware.
+
+In the panel, keep **Mode: Existing LAN**, select the adapter, acknowledge
 **Serve the installer on this LAN**, and click **Start serving**. Your router
 continues supplying addresses and internet access to the host and targets.
 
@@ -144,9 +156,10 @@ network. The equivalent command is:
 pxe-dust start enp1s0 --dedicated
 ```
 
-Neither mode accepts a wireless adapter or bridge member. Existing LAN mode
-requires a connected, addressed adapter; dedicated mode requires an unaddressed,
-down adapter. The CLI requires one explicit mode and never guesses.
+Existing LAN mode accepts a physical Ethernet or Wi-Fi adapter with one
+usable IPv4 address. Dedicated mode accepts only an unaddressed, down physical
+Ethernet adapter. Neither mode accepts virtual adapters or bridge members.
+The CLI requires one explicit mode and never guesses.
 
 Choose UEFI IPv4 network boot on the target. Secure Boot must be disabled for
 this initial implementation. The normal installer chooses the target disk,
@@ -169,7 +182,7 @@ booted from the network enter the installer.
   connection. If it still has its administrative `UP` flag, bring only that
   adapter down with `sudo ip link set dev INTERFACE down`. USB Ethernet is a
   convenient dedicated adapter.
-- **No unique LAN IPv4 address:** connect the Ethernet adapter and obtain an
+- **No unique LAN IPv4 address:** connect the selected network adapter and obtain an
   address from the existing router first. Multiple IPv4 addresses are currently
   rejected rather than choosing one silently.
 - **Address changed:** the service stops and removes its firewall rules. Restart
@@ -188,7 +201,12 @@ booted from the network enter the installer.
 - **Interrupted image replacement:** inspect `/var/lib/pxe-dust/previous-image`.
   It is deliberately retained rather than silently deleted on the next attempt.
 - **No boot:** check UEFI IPv4 PXE, Secure Boot, cable/link, and target RAM. Real
-  firmware compatibility and full installer completion still need validation.
+  compatibility with other firmware and disk installation still need validation.
+- **Linux reports `SIOCGIFFLAGS: No such device`:** ensure the served
+  `/boot.ipxe` contains `BOOTIF=01-${netX/mac:hexhyp}`. Restart an active service
+  after updating its helper. This handoff avoids the Omarchy 4.0.4 early DHCP
+  client's failing interface-discovery path. In Existing LAN mode, Linux still
+  obtains its address from the router.
 
 ## Files and network access
 
@@ -251,6 +269,12 @@ selection, TFTP and temporary iptables cleanup. It changes no host interfaces or
 firewall rules, uses no sudo, and requires Linux unprivileged user namespaces,
 `unshare`, `nsenter`, `ip`, `iptables`, and an explicit dnsmasq binary. It does not
 boot firmware or run an Omarchy installation.
+For Omarchy 4.0.4, extract its initramfs with `lsinitcpio --extract` in a temporary
+directory, then run `python3 tests/initramfs_network_smoke.py /absolute/path/to/usr/bin/ipconfig`.
+This optional regression check runs the ISO's real DHCP client against dnsmasq
+on private virtual interfaces: it reproduces the discovery error and verifies
+that an explicit boot interface obtains a lease. It uses private mount
+namespaces for sysfs and DHCP output files and never starts a host service.
 See [hardware acceptance](docs/ACCEPTANCE.md) for the deployment checks still
 needed before calling this production-ready.
 

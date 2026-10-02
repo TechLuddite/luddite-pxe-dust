@@ -1,9 +1,43 @@
 # Hardware acceptance
 
-This checklist is pending. Automated tests do not establish that firmware can
-boot a real Omarchy release or that an installation completes.
+This checklist is partially validated. The observed result below establishes
+one physical boot into the full installer. A disk installation and the remaining
+hardware matrix are still pending; automated tests do not establish those results.
 
-Run both topologies: first a host with one Ethernet adapter on an existing
+## Observed result: 2026-10-02 UTC
+
+Topology: a physical Wi-Fi host in Existing LAN mode, with a wired UEFI x86-64
+desktop on the access point's LAN. The journal identifies PXE architecture 7.
+The AP/router model, target adapter model, and firmware version were not recorded.
+
+Image: official Omarchy 4.0.4, with verified publisher signature and SHA-256
+`ddeded2758c48318d201dfdac905ecb28f570441883f0c052ea3cd5d05acf92d`.
+Host packages: dnsmasq 2.93-1, ipxe 2.0.0-2, Python 3.14.7-1,
+iproute2 7.2.0-1, iptables 1:1.8.13-1, and libarchive 3.8.9-1.
+
+- Initial boot reached Linux but stopped at `SIOCGIFFLAGS: No such device`,
+  followed by the early DHCP timeout. The real ISO's `ipconfig` reproduced this
+  failure in private namespaces with `ip=dhcp`; selecting an explicit interface
+  obtained a test-router lease.
+- After adding `BOOTIF=01-${netX/mac:hexhyp}` to the iPXE script, the user
+  confirmed a successful boot all the way into the full interactive installer.
+  The service remained in proxy mode; the LAN router supplied addresses.
+- The user deliberately stopped before installing because the target still
+  needs Windows. No disk installation or subsequent disk boot was tested.
+- Stopping through the widget prompted for credentials and succeeded. Independent
+  checks found the service inactive with a successful systemd result, no listeners
+  on UDP 67/69/4011 or TCP 8080, no session or PXE network namespace, and no
+  `PXDUST_` firewall chains/jumps. The host's Wi-Fi interface remained connected.
+- Automated checks passed: 37 unit tests and `make check`, QML mode-selection
+  smoke check, proxy DHCP/TFTP/firewall smoke check, and the real ISO DHCP-client
+  regression check.
+
+Next physical test: complete an interactive installation on a disposable target,
+then boot it from disk. Other firmware, architecture 9, concurrent clients,
+dedicated networking, and the failure/recovery matrix below still need physical
+validation.
+
+Run the wired topologies: first a host with one Ethernet adapter on an existing
 router/switch LAN, then a spare USB Ethernet adapter on an isolated installation
 switch. Use a target with at least 16 GiB RAM and a disposable target disk.
 Record the Omarchy ISO URL and SHA-256, host package versions, target firmware,
@@ -20,7 +54,9 @@ adapter model, router/DHCP implementation, and observed result.
    selected interface, and that HTTP/TFTP destinations are the selected IPv4.
    Verify against the actual host firewall, including UFW if enabled.
 4. Boot UEFI architecture 7 and 9 clients, including iPXE's second DHCP round and
-   PXE boot-server requests on UDP 4011. Complete the interactive installation.
+   PXE boot-server requests on UDP 4011. Confirm the kernel command line's
+   `BOOTIF` matches the boot NIC, and Linux's early DHCP client obtains a router
+   lease on that interface. Complete the interactive installation.
 5. During serving, change the host's IPv4 address or disconnect its adapter.
    Confirm the service stops, removes its firewall rules, and does not restore,
    disconnect or otherwise modify the host's normal connection. Restart and
@@ -30,6 +66,17 @@ adapter model, router/DHCP implementation, and observed result.
 7. Confirm subnet/VLAN boundaries and DHCP snooping constraints are documented
    for the tested network. Firmware compatibility is not established by a
    synthetic DHCP test alone.
+
+## Wi-Fi host / wired targets
+
+Repeat the Existing LAN checks with the host using its connected Wi-Fi adapter
+and targets connected by Ethernet to the access point's bridged LAN. Record
+SSID, AP model, isolation/VLAN settings, and broadcast filtering. Verify proxy
+DHCP discovery, UDP 4011, TFTP, HTTP, and a complete physical installation.
+Confirm Wi-Fi roaming or address changes stop services when the selected
+interface's address or identity changes. Confirm Dedicated network mode never
+offers or repurposes the Wi-Fi adapter. A synthetic Ethernet namespace test does
+not establish that the actual access point forwards these packets.
 
 ## Dedicated network and common installer checks
 

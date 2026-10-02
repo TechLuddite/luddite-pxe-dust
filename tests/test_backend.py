@@ -58,6 +58,7 @@ class ConfigurationTests(unittest.TestCase):
         script = dust.boot_script(True).decode()
         self.assertIn("archiso_http_srv=${base}/", script)
         self.assertIn("initrd=initramfs.img", script)
+        self.assertIn("BOOTIF=01-${netX/mac:hexhyp}", script)
         self.assertIn("cms_verify=y", script)
         self.assertNotIn("cms_verify=y", dust.boot_script(False).decode())
 
@@ -311,6 +312,48 @@ class LANTests(unittest.TestCase):
             self.assertEqual(result['network'], '192.0.2.0/24')
             command.assert_not_called()
             ip.assert_called_once_with('-j', 'address', 'show', 'dev', 'enp1s0')
+
+    def test_wifi_host_is_accepted_only_in_existing_lan_mode(self):
+        row = self.row()
+        row['ifname'] = 'wlo1'
+        with patch.object(dust, 'REQUIRED', ()), patch.object(dust, 'IPXE') as efi, \
+             patch.object(dust.os, 'access', return_value=True), \
+             patch.object(Path, 'exists', autospec=True,
+                          side_effect=lambda p: p.name in ('device', 'wireless')), \
+             patch.object(dust, 'ip', return_value=json.dumps([row]).encode()), \
+             patch.object(dust, 'bounded') as command:
+            efi.is_file.return_value = True
+            session = dust.preflight('wlo1', 'lan')
+            self.assertEqual(session['interface'], 'wlo1')
+            self.assertEqual(session['server'], '192.0.2.10')
+            config = dust.dnsmasq_config(session).decode()
+            self.assertIn('interface=wlo1\n', config)
+            self.assertIn('dhcp-range=192.0.2.0,proxy,255.255.255.0', config)
+            with self.assertRaisesRegex(dust.Error, 'Dedicated network mode requires'):
+                dust.preflight('wlo1', 'dedicated')
+            command.assert_not_called()
+
+    def test_discovery_includes_physical_wifi_and_excludes_virtual_adapters(self):
+        wired, wifi, bridge = self.row(), self.row(), self.row()
+        wifi['ifname'] = 'wlo1'
+        bridge['ifname'] = 'docker0'
+        def exists(path):
+            return ((path.name == 'device' and path.parent.name in ('enp1s0', 'wlo1'))
+                    or (path.name == 'wireless' and path.parent.name == 'wlo1'))
+        with patch.object(Path, 'exists', autospec=True, side_effect=exists), \
+             patch.object(dust, 'ip', return_value=json.dumps([wired, wifi, bridge]).encode()):
+            found = dust.interfaces()
+        self.assertEqual([(x['name'], x['wireless']) for x in found],
+                         [('enp1s0', False), ('wlo1', True)])
+
+    def test_lan_refuses_virtual_interfaces_and_bridge_members(self):
+        for extra in ({'master': 'br0'}, {'linkinfo': {'info_kind': 'veth'}}):
+            with self.subTest(extra=extra), patch.object(dust, 'REQUIRED', ()), \
+                 patch.object(dust, 'IPXE') as efi, \
+                 patch.object(dust, 'ip', return_value=json.dumps([self.row() | extra]).encode()):
+                efi.is_file.return_value = True
+                with self.assertRaisesRegex(dust.Error, 'physical network interface'):
+                    dust.preflight('enp1s0', 'lan')
 
     def test_reject_ambiguous_or_missing_ipv4(self):
         row = self.row()

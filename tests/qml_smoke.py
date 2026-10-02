@@ -35,14 +35,45 @@ ShellRoot {
         function showTooltip() {}
         function hideTooltip() {}
     }
-    Plugin.Panel { bar: mockBar }
-    Timer { interval: 1800; running: true; onTriggered: Qt.quit() }
+    Plugin.Panel { id: panel; bar: mockBar }
+    Timer {
+        interval: 1800
+        running: true
+        onTriggered: {
+            panel.networkMode = "lan"
+            panel.apply(JSON.stringify({state: "inactive", installed: true, prepared: true,
+                mode: "", interface: "", missing: [], interfaces: [
+                    {name: "wlo1", wireless: true}, {name: "enp1s0", wireless: false}]}))
+            if (panel.interfaceName !== "wlo1" || panel.availableInterfaces.length !== 2) {
+                console.error("Wi-Fi host missing from Existing LAN mode")
+                Qt.quit(1)
+                return
+            }
+            panel.acknowledged = true
+            panel.networkMode = "dedicated"
+            if (panel.interfaceName !== "enp1s0" || panel.availableInterfaces.length !== 1 || panel.acknowledged) {
+                console.error("Dedicated mode must offer only Ethernet and clear acknowledgement")
+                Qt.quit(1)
+                return
+            }
+            panel.apply(JSON.stringify({state: "inactive", installed: true, prepared: true,
+                mode: "", interface: "", missing: [], interfaces: [{name: "wlo1", wireless: true}]}))
+            if (panel.interfaceName !== "" || panel.availableInterfaces.length !== 0) {
+                console.error("Dedicated mode accepted a Wi-Fi-only host")
+                Qt.quit(1)
+                return
+            }
+            console.log("PXE Wi-Fi mode selection checks passed")
+            Qt.quit()
+        }
+    }
 }
 ''')
     result = subprocess.run(['/usr/bin/quickshell', '--no-color', '-p', str(directory)],
                             text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             timeout=15, env=dict(os.environ))
     print(result.stdout)
-    failures = ('Failed to load', 'TypeError', 'ReferenceError', 'Cannot assign', 'is not a type', 'is not available', 'Unable to assign')
+    failures = ('Failed to load', 'TypeError', 'ReferenceError', 'Cannot assign', 'is not a type', 'is not available', 'Unable to assign',
+                'Wi-Fi host missing', 'Dedicated mode must', 'Dedicated mode accepted')
     if result.returncode or any(word in result.stdout for word in failures):
         raise SystemExit(1)

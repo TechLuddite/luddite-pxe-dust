@@ -186,17 +186,17 @@ def mutation_lock():
 
 def interface_name(value):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,14}", value) or value == "lo":
-        raise Error("Invalid Ethernet interface name")
+        raise Error("Invalid network interface name")
     return value
 
 
 def interfaces():
     links = json.loads(ip("-j", "address", "show"))
     return [{"name": x["ifname"], "up": "UP" in x.get("flags", []),
-             "addresses": len(x.get("addr_info", []))}
+             "addresses": len(x.get("addr_info", [])),
+             "wireless": Path("/sys/class/net", x["ifname"], "wireless").exists()}
             for x in links[:128] if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,14}", x["ifname"])
-            and x.get("link_type") == "ether" and Path("/sys/class/net", x["ifname"], "device").exists()
-            and not Path("/sys/class/net", x["ifname"], "wireless").exists()]
+            and x.get("link_type") == "ether" and Path("/sys/class/net", x["ifname"], "device").exists()]
 
 
 def preflight(name, mode="dedicated"):
@@ -210,20 +210,21 @@ def preflight(name, mode="dedicated"):
         raise Error("Missing prerequisites: " + ", ".join(missing))
     rows = json.loads(ip("-j", "address", "show", "dev", name))
     if len(rows) != 1:
-        raise Error("Ethernet interface not found")
+        raise Error("Network interface not found")
     row = rows[0]
-    if (row.get("link_type") != "ether" or row.get("master") or row.get("linkinfo")
-            or Path("/sys/class/net", name, "wireless").exists()):
-        raise Error("Select a physical Ethernet interface")
+    if row.get("link_type") != "ether" or row.get("master") or row.get("linkinfo"):
+        raise Error("Select a physical network interface")
     if mode == "lan":
         if not Path("/sys/class/net", name, "device").exists():
-            raise Error("Select a physical Ethernet adapter")
+            raise Error("Select a physical Ethernet or Wi-Fi adapter")
         if not os.access("/usr/bin/iptables", os.X_OK):
             raise Error("Existing LAN mode requires iptables for temporary firewall rules")
         server, network = lan_address(row)
         return {"mode": "lan", "interface": name, "ifindex": row["ifindex"],
                 "address": row["address"], "server": server, "network": network,
                 "firewall_chain": "PXDUST_" + os.urandom(6).hex()}
+    if Path("/sys/class/net", name, "wireless").exists():
+        raise Error("Dedicated network mode requires a physical Ethernet interface")
     if "UP" in row.get("flags", []) or row.get("addr_info"):
         raise Error("Disconnect the dedicated interface first; it must be down with no addresses")
     if not Path("/sys/class/net", name, "device").exists():
@@ -242,7 +243,7 @@ def preflight(name, mode="dedicated"):
 
 def lan_address(row):
     if "UP" not in row.get("flags", []):
-        raise Error("Existing LAN mode needs a connected Ethernet interface")
+        raise Error("Existing LAN mode needs a connected network interface")
     addresses = [a for a in row.get("addr_info", []) if a.get("family") == "inet" and a.get("scope") == "global"]
     if len(addresses) != 1:
         raise Error("Existing LAN mode needs exactly one global-scope IPv4 address")
@@ -335,6 +336,7 @@ def boot_script(signed, server=SERVER):
             f"set base http://{server}:{PORT}\n"
             "echo Starting the Omarchy installer from Luddite PXE Dust\n"
             "kernel ${base}/vmlinuz initrd=initramfs.img ip=dhcp "
+            "BOOTIF=01-${netX/mac:hexhyp} "
             "archisobasedir=arch archiso_http_srv=${base}/ "
             f"initramfs_async=0{verify}\n"
             "initrd --name initramfs.img ${base}/initramfs.img\n"
@@ -772,7 +774,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", action="version", version=VERSION)
     sub = parser.add_subparsers(dest="action", required=True)
-    sub.add_parser("status", help="Read service, image and Ethernet status as JSON")
+    sub.add_parser("status", help="Read service, image and network interface status as JSON")
     prep = sub.add_parser("prepare", help="Verify a local Omarchy ISO and cache its boot assets")
     prep.add_argument("iso")
     prep.add_argument("sha256")
