@@ -322,6 +322,12 @@ See [contributor guidance](docs/CONTRIBUTING.md) for implementation constraints
 and the scope of the observed hardware evidence. Keep automatically loaded
 agent instructions outside the distributed plugin checkout.
 
+CI (`.github/workflows/ci.yml`) runs three jobs:
+
+- `test`, on every push and pull request: the Python suite and `tests/test_repo.py`, which checks the manifest and entry points, symlinks, agent instruction files, hidden bidirectional Unicode, `textFormat` on every QML `Text`, bounded process output, and the marketplace scanner's file limits. The smoke checks above are not run in CI.
+- `scout`, on push: [Luddite Scout](https://github.com/TechLuddite/Luddite-Scout) at a pinned commit reviews the repository as GitHub serves it. Any HIGH or MEDIUM finding fails the job.
+- `baseline`, on push: the marketplace's Automated Security Baseline at a pinned commit scans the pushed commit. Anything other than `passed` with no findings fails the job.
+
 Boot parameters follow the upstream
 [Arch HTTP hook](https://gitlab.archlinux.org/archlinux/mkinitcpio/mkinitcpio-archiso/-/blob/master/hooks/archiso_pxe_http).
 The network-boot hooks are included in the
