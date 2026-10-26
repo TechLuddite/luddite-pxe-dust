@@ -4,6 +4,7 @@
   "name": "Luddite PXE Dust",
   "version": "0.2.0",
   "author": "TechLuddite",
+  "license": "MIT",
   "description": "Serve the Omarchy installer on your existing LAN or a dedicated Ethernet network",
   "kinds": ["bar-widget"],
   "entryPoints": {"barWidget": "Panel.qml"},
