@@ -324,7 +324,11 @@ def main():
     if os.geteuid() == 0:
         raise InstallError('Run make install as your normal user; checkout code must not run as root')
     # Authenticate on the user's terminal before using the lock supervisor's pipes.
-    subprocess.run(['/usr/bin/sudo', '-v'], check=True, timeout=120)
+    # sudo -v demands a password whenever any matching rule needs one, even with
+    # NOPASSWD access, so prompt only if a non-interactive call is refused.
+    if subprocess.run(['/usr/bin/sudo', '-n', '/usr/bin/true'], stdin=subprocess.DEVNULL,
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20).returncode:
+        subprocess.run(['/usr/bin/sudo', '-v'], check=True, timeout=120)
     def interrupted(signum, frame):
         raise InstallError('Installation interrupted')
     signal.signal(signal.SIGTERM, interrupted)
