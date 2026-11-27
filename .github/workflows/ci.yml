@@ -24,54 +24,33 @@ jobs:
         run: sudo apt-get install -y --no-install-recommends libarchive-tools
       - run: python3 -m unittest discover -s tests -v
 
-  # Luddite Scout reviews the repository as GitHub serves it: repository setup,
-  # agent instruction files, hidden Unicode, Actions, dependencies, build-time
-  # code and the Omarchy plugin rules. It runs nothing from this repository.
-  # Fails on any HIGH or MEDIUM finding.
+  # Luddite Scout reads the checkout: agent instruction files, hidden Unicode,
+  # Actions, dependencies, build-time code and the Omarchy plugin rules. It
+  # runs nothing from this repository. Fails on any HIGH or MEDIUM finding
+  # that .scout-accepted.json does not list with a reason, on a listed entry
+  # that no longer matches a finding, and on a check that could not finish.
   scout:
-    if: github.event_name == 'push'
     needs: test
     runs-on: ubuntu-latest
-    env:
-      SCOUT_REPO: https://github.com/TechLuddite/Luddite-Scout
-      SCOUT_SHA: d484fb96482e74681adcc42d22b88fb6db26920f
+    timeout-minutes: 10
     steps:
-      - name: Fetch Luddite Scout at a pinned commit
-        run: |
-          git init -q scout
-          git -C scout -c core.hooksPath=/dev/null fetch -q --depth 1 -- "$SCOUT_REPO" "$SCOUT_SHA"
-          test "$(git -C scout rev-parse 'FETCH_HEAD^{commit}')" = "$SCOUT_SHA"
-          git -C scout -c core.hooksPath=/dev/null -c advice.detachedHead=false checkout -q FETCH_HEAD
-      - name: Scan this repository
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          printf '%s\n' "$GH_TOKEN" \
-            | python3 -I -S scout/bin/scout --json --token-stdin "$GITHUB_REPOSITORY" > report.json
-          python3 -I -S - <<'EOF'
-          import json, os, sys
-          r = json.load(open("report.json"))
-          if "error" in r:
-              sys.exit(f"Scout could not scan: {r['error']}")
-          if r.get("commit") != os.environ["GITHUB_SHA"]:
-              print(f"main moved on to {r.get('commit')}; that push runs its own scan.")
-              sys.exit(0)
-          bad, lines = 0, ["| Check | Severity | Finding | Where |", "|---|---|---|---|"]
-          for check in r.get("checks", []):
-              for f in check.get("findings", []):
-                  sev = f.get("severity", "")
-                  where = f"{f['path']}:{f.get('line', '')}" if f.get("path") else ""
-                  lines.append(f"| {check.get('id')} | {sev} | {f.get('title', '')} | {where} |")
-                  bad += sev in ("high", "medium")
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
-              out.write(f"## Luddite Scout at {r['commit'][:12]}\n\n" + "\n".join(lines) + "\n")
-          print("\n".join(lines))
-          sys.exit(1 if bad else 0)
-          EOF
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: TechLuddite/luddite-scout-action@b34b6a811b70e99c51a8e9b1f4a1aeecc786d99d
+        with:
+          fail-on: medium
+          accepted: .scout-accepted.json
+          name: ${{ github.repository }}
+          commit: ${{ github.event.pull_request.head.sha || github.sha }}
 
   # The marketplace's own Automated Security Baseline, the scan a submission
-  # gets, run against the pushed commit. Fails unless it reports `passed` with
-  # no findings and no review capabilities.
+  # gets, run against the pushed commit. A plugin with a root helper always
+  # reports review capabilities, so the outcome is `review-required` at best.
+  # Fails on a `failed` outcome, on any finding, and on a capability that is
+  # not in ACCEPTED_CAPABILITIES. A new capability means the plugin gained a
+  # kind of access, and adding it to the list is the review.
   baseline:
     if: github.event_name == 'push'
     needs: test
@@ -79,6 +58,7 @@ jobs:
     env:
       MARKETPLACE_REPO: https://github.com/omacom/omarchy-plugin-marketplace
       MARKETPLACE_SHA: fd5874893f5f4690570d2d88e8bcfb6df9f30184
+      ACCEPTED_CAPABILITIES: installer package-manager privilege service-management
     steps:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -101,5 +81,8 @@ jobs:
             `https://github.com/${process.env.GITHUB_REPOSITORY}`, process.env.GITHUB_SHA,
             { token: process.env.GITHUB_TOKEN, requiredPaths: ["manifest.json"] });
           console.log(JSON.stringify({ outcome: r.outcome, findings: r.findings, capabilities: r.capabilities }, null, 2));
-          const clean = r.outcome === "passed" && !(r.findings || []).length && !(r.capabilities || []).length;
-          process.exit(clean ? 0 : 1);'
+          const accepted = new Set(process.env.ACCEPTED_CAPABILITIES.split(/\s+/).filter(Boolean));
+          const extra = (r.capabilities || []).map((c) => c.id).filter((id) => !accepted.has(id));
+          if (extra.length) console.log(`Capabilities not in ACCEPTED_CAPABILITIES: ${extra.join(", ")}`);
+          const ok = ["passed", "review-required"].includes(r.outcome) && !(r.findings || []).length && !extra.length;
+          process.exit(ok ? 0 : 1);'
