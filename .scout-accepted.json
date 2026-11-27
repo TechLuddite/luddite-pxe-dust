@@ -1,0 +1,24 @@
+{
+  "accepted": [
+    {
+      "rule": "S7.sudo",
+      "path": "tools/install-system.py",
+      "reason": "The installer places the root helper and its polkit policy. It calls sudo by absolute path with -n, and privilege is the documented purpose of this plugin."
+    },
+    {
+      "rule": "S7.sudo",
+      "path": "tests/test_install.py",
+      "reason": "The test asserts the exact sudo argv the installer builds. It runs no sudo."
+    },
+    {
+      "rule": "S7.sudo",
+      "path": "tests/initramfs_network_smoke.py",
+      "reason": "The only match is the word in a docstring that says no sudo is used."
+    },
+    {
+      "rule": "S7.sudo",
+      "path": "tests/network_smoke.py",
+      "reason": "The only match is the word in a docstring that says no sudo is used."
+    }
+  ]
+}
